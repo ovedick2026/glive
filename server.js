@@ -1,137 +1,152 @@
+import http from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
+
 const DEFAULT_GEMINI_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/" +
   "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const DEFAULT_MODEL = "gemini-3.8-live";
 const SETUP_TIMEOUT_MS = 15_000;
+const PORT = process.env.PORT || 3000;
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+function checkAuth(req, url, env) {
+  if (!env.ACCESS_PASSWORD) return true;
 
-    // 密码访问验证：配置了 ACCESS_PASSWORD 时生效
-    let authedToken = "";
-    if (env.ACCESS_PASSWORD) {
-      const expectedPassword = String(env.ACCESS_PASSWORD).trim();
-      const cookieAuth = request.headers.get("Cookie")?.match(/(?:^|;\s*)auth=([^;]+)/)?.[1];
-      const queryPwd = url.searchParams.get("pwd") || url.searchParams.get("auth");
-      const authHeader = request.headers.get("Authorization");
+  const expectedPassword = String(env.ACCESS_PASSWORD).trim();
+  const cookieHeader = req.headers["cookie"] || "";
+  const cookieAuth = cookieHeader.match(/(?:^|;\s*)auth=([^;]+)/)?.[1];
+  const queryPwd = url.searchParams.get("pwd");
+  const authHeader = req.headers["authorization"];
 
-      let isAuthed = false;
-      if (queryPwd && queryPwd === expectedPassword) {
-        isAuthed = true;
-      } else if (cookieAuth && decodeURIComponent(cookieAuth) === expectedPassword) {
-        isAuthed = true;
-      } else if (authHeader && authHeader.startsWith("Basic ")) {
-        try {
-          const decoded = atob(authHeader.slice(6));
-          const inputPwd = decoded.includes(":") ? decoded.split(":")[1] : decoded;
-          if (inputPwd === expectedPassword || decoded === expectedPassword) {
-            isAuthed = true;
-          }
-        } catch {}
+  if (queryPwd && queryPwd === expectedPassword) {
+    return true;
+  }
+  if (cookieAuth && decodeURIComponent(cookieAuth) === expectedPassword) {
+    return true;
+  }
+  if (authHeader && authHeader.startsWith("Basic ")) {
+    try {
+      const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+      const inputPwd = decoded.includes(":") ? decoded.split(":")[1] : decoded;
+      if (inputPwd === expectedPassword || decoded === expectedPassword) {
+        return true;
       }
+    } catch {}
+  }
 
-      if (!isAuthed) {
-        return new Response("Unauthorized", {
-          status: 401,
-          headers: {
-            "WWW-Authenticate": 'Basic realm="Gemini Live Voice"',
-            "content-type": "text/plain; charset=UTF-8",
-          },
-        });
-      }
-      authedToken = expectedPassword;
-    }
+  return false;
+}
 
-    if (url.pathname === "/ws") {
-      return handleBrowserWebSocket(request, env, ctx);
-    }
+function getRequestUrl(req) {
+  const proto = req.headers["x-forwarded-proto"]
+    ? String(req.headers["x-forwarded-proto"]).split(",")[0].trim()
+    : "http";
+  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
+  return new URL(req.url || "/", `${proto}://${host}`);
+}
 
-    if (url.pathname !== "/" || request.method !== "GET") {
-      return new Response("Not Found", { status: 404 });
-    }
+const server = http.createServer((req, res) => {
+  const env = process.env;
+  const url = getRequestUrl(req);
 
-    const headers = {
-      "content-type": "text/html; charset=UTF-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-      "permissions-policy": "microphone=(self)",
-      "content-security-policy": [
-        "default-src 'self'",
-        "style-src 'unsafe-inline'",
-        "script-src 'unsafe-inline'",
-        "connect-src 'self' wss:",
-        "media-src 'self' blob:",
-        "img-src 'self' data:",
-        "base-uri 'none'",
-        "form-action 'self'",
-        "frame-ancestors 'none'",
-      ].join("; "),
-    };
+  // Render 健康检查接口
+  if (url.pathname === "/healthz") {
+    res.writeHead(200, { "content-type": "text/plain; charset=UTF-8" });
+    res.end("OK");
+    return;
+  }
 
-    if (authedToken) {
-      headers["set-cookie"] = `auth=${encodeURIComponent(authedToken)}; Path=/; Max-Age=2592000; Secure; SameSite=Lax`;
-    }
+  // 密码访问验证：配置了 ACCESS_PASSWORD 时生效，防止未授权消耗额度
+  if (!checkAuth(req, url, env)) {
+    res.writeHead(401, {
+      "WWW-Authenticate": 'Basic realm="Gemini Live Voice"',
+      "content-type": "text/plain; charset=UTF-8",
+    });
+    res.end("Unauthorized");
+    return;
+  }
 
-    const renderedHtml = HTML.replace(
-      "__AUTH_TOKEN_PLACEHOLDER__",
-      JSON.stringify(authedToken)
-    );
+  if (url.pathname !== "/" || req.method !== "GET") {
+    res.writeHead(404, { "content-type": "text/plain; charset=UTF-8" });
+    res.end("Not Found");
+    return;
+  }
 
-    return new Response(renderedHtml, { headers });
-  },
-};
+  const headers = {
+    "content-type": "text/html; charset=UTF-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "microphone=(self)",
+    "content-security-policy": [
+      "default-src 'self'",
+      "style-src 'unsafe-inline'",
+      "script-src 'unsafe-inline'",
+      "connect-src 'self' wss: ws:",
+      "media-src 'self' blob:",
+      "img-src 'self' data:",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+    ].join("; "),
+  };
 
-function handleBrowserWebSocket(request, env, ctx) {
-  const upgrade = request.headers.get("Upgrade");
+  // 如果通过 ?pwd= 访问成功，顺便写入 Cookie 供后续和 WebSocket 免密使用
+  if (env.ACCESS_PASSWORD && url.searchParams.get("pwd") === String(env.ACCESS_PASSWORD).trim()) {
+    headers["set-cookie"] = `auth=${encodeURIComponent(env.ACCESS_PASSWORD)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`;
+  }
 
-  if (!upgrade || upgrade.toLowerCase() !== "websocket") {
-    return new Response("Expected Upgrade: websocket", { status: 426 });
+  const defaultVoice = String(env.GEMINI_VOICE || "Kore").trim();
+  const pageHtml = HTML.replace("__DEFAULT_VOICE__", defaultVoice);
+
+  res.writeHead(200, headers);
+  res.end(pageHtml);
+});
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const env = process.env;
+  const url = getRequestUrl(req);
+
+  if (url.pathname !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  if (!checkAuth(req, url, env)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+    return;
   }
 
   /*
    * WebSocket 并不受普通 CORS 保护。
-   * 默认只允许当前 Worker 页面所在 Origin 发起连接。
+   * 默认只允许当前页面所在 Origin 发起连接。
    *
    * 如使用自定义域名，可显式设置：
    * ALLOWED_ORIGIN=https://voice.example.com
    */
-  const requestOrigin = request.headers.get("Origin");
-  const allowedOrigin = String(
-    env.ALLOWED_ORIGIN || new URL(request.url).origin,
-  ).replace(/\/$/, "");
+  const requestOrigin = req.headers["origin"];
+  const allowedOrigin = String(env.ALLOWED_ORIGIN || url.origin).replace(/\/$/, "");
 
   if (!requestOrigin || requestOrigin !== allowedOrigin) {
-    return new Response("Forbidden WebSocket origin", { status: 403 });
+    socket.write("HTTP/1.1 403 Forbidden WebSocket origin\r\n\r\n");
+    socket.destroy();
+    return;
   }
 
-  const pair = new WebSocketPair();
-  const [client, browser] = Object.values(pair);
+  const requestedVoice = url.searchParams.get("voice") || "";
 
-  /*
-   * allowHalfOpen 对代理场景更合适：
-   * 浏览器或 Gemini 任一端关闭时，由我们协调另一端。
-   */
-  browser.accept({ allowHalfOpen: true });
-
-  const bridge = createGeminiBridge(browser, env);
-  bridge.install();
-
-  /*
-   * 不阻塞浏览器 WebSocket 升级；
-   * 上游握手和 Gemini setup 在后台进行。
-   */
-  ctx.waitUntil(bridge.connect());
-
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
+  wss.handleUpgrade(req, socket, head, (browser) => {
+    const bridge = createGeminiBridge(browser, env, requestedVoice);
+    bridge.install();
+    void bridge.connect();
   });
-}
+});
 
-function createGeminiBridge(browser, env) {
+function createGeminiBridge(browser, env, requestedVoice) {
   let upstream = null;
   let phase = "connecting"; // connecting | setting-up | ready | closed
   let closed = false;
@@ -159,7 +174,12 @@ function createGeminiBridge(browser, env) {
         socket.readyState === WebSocket.OPEN ||
         socket.readyState === WebSocket.CLOSING
       ) {
-        socket.close(code, reason.slice(0, 120));
+        const safeCode =
+          typeof code === "number" &&
+          (code === 1000 || (code >= 3000 && code <= 4999) || code === 1011)
+            ? code
+            : 1000;
+        socket.close(safeCode, reason.slice(0, 120));
       }
     } catch {
       // 连接关闭阶段忽略异常。
@@ -180,7 +200,7 @@ function createGeminiBridge(browser, env) {
   function fail(message) {
     if (closed) return;
 
-    console.error("[Gemini Live Worker]", message);
+    console.error("[Gemini Live Server]", message);
 
     sendToBrowser({
       type: "error",
@@ -198,7 +218,7 @@ function createGeminiBridge(browser, env) {
     let config;
 
     try {
-      config = getGeminiConfig(env);
+      config = getGeminiConfig(env, requestedVoice);
     } catch (error) {
       fail(errorMessage(error));
       return;
@@ -210,52 +230,62 @@ function createGeminiBridge(browser, env) {
       message: "正在连接 Gemini…",
     });
 
-    let response;
-
     try {
-      /*
-       * Cloudflare Worker 的出站 WebSocket：
-       * 用 https + Upgrade: websocket 发起，再从 response.webSocket 获取 socket。
-       */
-      response = await fetch(config.fetchUrl, {
-        headers: {
-          Upgrade: "websocket",
-        },
-      });
+      upstream = new WebSocket(config.wsUrl);
+      upstream.binaryType = "arraybuffer";
     } catch (error) {
-      fail(
-        "无法建立到 Gemini 的 WebSocket 连接：" +
-          errorMessage(error),
-      );
+      fail("无法建立到 Gemini 的 WebSocket 连接：" + errorMessage(error));
       return;
     }
 
-    if (!response.webSocket) {
-      const detail = await readHandshakeError(response);
+    upstream.on("unexpected-response", (req, res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        const detail = parseErrorText(body);
+        fail(
+          "Gemini WebSocket 握手失败（HTTP " +
+            res.statusCode +
+            "）" +
+            (detail ? "：" + detail : ""),
+        );
+      });
+    });
 
-      fail(
-        "Gemini WebSocket 握手失败（HTTP " +
-          response.status +
-          "）" +
-          (detail ? "：" + detail : ""),
-      );
-      return;
-    }
+    upstream.addEventListener("open", () => {
+      if (closed) {
+        try {
+          upstream.close(1000, "browser already closed");
+        } catch {}
+        return;
+      }
 
-    if (closed) {
+      phase = "setting-up";
+
+      sendToBrowser({
+        type: "status",
+        state: "setting-up",
+        message: "Gemini 已连接，正在初始化会话…",
+      });
+
       try {
-        response.webSocket.close(1000, "browser already closed");
-      } catch {}
-      return;
-    }
+        upstream.send(JSON.stringify(createSetupMessage(config)));
+      } catch (error) {
+        fail("无法发送 Gemini setup 消息：" + errorMessage(error));
+        return;
+      }
 
-    upstream = response.webSocket;
-
-    /*
-     * 新兼容日期下，二进制 WS 消息默认可能是 Blob。
-     * 明确设为 ArrayBuffer，避免旧代码出现 "[object Blob]"。
-     */
-    upstream.binaryType = "arraybuffer";
+      setupTimer = setTimeout(() => {
+        if (phase === "setting-up" && !closed) {
+          fail(
+            "等待 Gemini setupComplete 超时（15 秒）。请检查 GEMINI_API_KEY、GEMINI_WS_URL、模型权限或服务器日志。",
+          );
+        }
+      }, SETUP_TIMEOUT_MS);
+    });
 
     upstream.addEventListener("message", (event) => {
       void handleGeminiMessage(event);
@@ -287,34 +317,11 @@ function createGeminiBridge(browser, env) {
         "Gemini upstream closed",
       );
     });
-
-    upstream.accept({ allowHalfOpen: true });
-
-    phase = "setting-up";
-
-    sendToBrowser({
-      type: "status",
-      state: "setting-up",
-      message: "Gemini 已连接，正在初始化会话…",
-    });
-
-    try {
-      upstream.send(JSON.stringify(createSetupMessage(config)));
-    } catch (error) {
-      fail("无法发送 Gemini setup 消息：" + errorMessage(error));
-      return;
-    }
-
-    setupTimer = setTimeout(() => {
-      if (phase === "setting-up" && !closed) {
-        fail(
-          "等待 Gemini setupComplete 超时（15 秒）。请检查 GEMINI_API_KEY、GEMINI_WS_URL、模型权限或 Worker 日志。",
-        );
-      }
-    }, SETUP_TIMEOUT_MS);
   }
 
   function install() {
+    browser.binaryType = "arraybuffer";
+
     browser.addEventListener("message", (event) => {
       void handleBrowserMessage(event);
     });
@@ -364,7 +371,7 @@ function createGeminiBridge(browser, env) {
 
       /*
        * 浏览器每次发的是几十毫秒 PCM，正常远小于这个限制。
-       * 防止异常客户端向 Worker / 上游推送超大消息。
+       * 防止异常客户端向服务器 / 上游推送超大消息。
        */
       if (
         !audioData ||
@@ -473,7 +480,7 @@ function createGeminiBridge(browser, env) {
   };
 }
 
-function getGeminiConfig(env) {
+function getGeminiConfig(env, requestedVoice) {
   const apiKey = requiredEnv(env, "GEMINI_API_KEY");
   const systemPrompt = requiredEnv(env, "GEMINI_SYSTEM_PROMPT");
 
@@ -484,14 +491,14 @@ function getGeminiConfig(env) {
   const endpoint = new URL(rawEndpoint);
 
   /*
-   * 环境变量允许填官方文档中的 wss:// 地址；
-   * Worker 内部 fetch 升级 WebSocket 时改为 https://。
+   * 环境变量允许填 https:// 或 wss:// 地址；
+   * Node.js WebSocket 客户端连接时统一转为 wss://。
    */
-  if (endpoint.protocol === "wss:") {
-    endpoint.protocol = "https:";
+  if (endpoint.protocol === "https:") {
+    endpoint.protocol = "wss:";
   }
 
-  if (endpoint.protocol !== "https:") {
+  if (endpoint.protocol !== "wss:") {
     throw new Error(
       "GEMINI_WS_URL 必须是 https:// 或 wss:// 的 WebSocket Endpoint。",
     );
@@ -501,14 +508,14 @@ function getGeminiConfig(env) {
 
   const model = getSafeModelName(env);
 
-  const voice = String(env.GEMINI_VOICE || "Kore").trim();
+  const voice = String(requestedVoice || env.GEMINI_VOICE || "Kore").trim();
 
   if (voice && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(voice)) {
     throw new Error("GEMINI_VOICE 格式不正确。");
   }
 
   return {
-    fetchUrl: endpoint.toString(),
+    wsUrl: endpoint.toString(),
     model,
     voice,
     systemPrompt,
@@ -574,15 +581,15 @@ function requiredEnv(env, name) {
   const value = typeof env[name] === "string" ? env[name].trim() : "";
 
   if (!value) {
-    throw new Error("缺少 Cloudflare 环境变量：" + name);
+    throw new Error("缺少环境变量：" + name);
   }
 
   return value;
 }
 
-async function readHandshakeError(response) {
+function parseErrorText(rawText) {
   try {
-    const text = (await response.text()).replace(/\s+/g, " ").trim();
+    const text = String(rawText || "").replace(/\s+/g, " ").trim();
 
     if (!text) return "";
 
@@ -604,6 +611,10 @@ async function readHandshakeError(response) {
 
 async function wsDataToText(data) {
   if (typeof data === "string") return data;
+
+  if (Buffer.isBuffer(data)) {
+    return data.toString("utf8");
+  }
 
   if (data instanceof ArrayBuffer) {
     return new TextDecoder().decode(data);
@@ -630,7 +641,7 @@ const HTML = String.raw`<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#090d18">
   <title>Gemini Live Call</title>
   <style>
@@ -652,9 +663,15 @@ const HTML = String.raw`<!doctype html>
       -webkit-tap-highlight-color: transparent;
     }
 
-    body {
-      min-height: 100svh;
+    html, body {
+      height: 100%;
       margin: 0;
+      padding: 0;
+    }
+
+    body {
+      height: 100svh;
+      height: 100dvh;
       overflow: hidden;
       color: var(--text);
       background:
@@ -668,27 +685,30 @@ const HTML = String.raw`<!doctype html>
     }
 
     .shell {
-      width: min(100%, 520px);
-      min-height: 100svh;
+      width: min(100%, 540px);
+      height: 100%;
       margin: 0 auto;
-      padding: max(18px, env(safe-area-inset-top))
-               20px
-               max(24px, env(safe-area-inset-bottom));
+      padding: max(12px, env(safe-area-inset-top))
+               18px
+               max(16px, env(safe-area-inset-bottom));
       display: flex;
       flex-direction: column;
+      justify-content: space-between;
     }
 
     .topbar {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
-      justify-content: center;
-      min-height: 45px;
-      text-align: center;
+      justify-content: space-between;
+      min-height: 40px;
+      gap: 10px;
     }
 
     .brand {
       display: grid;
       gap: 2px;
+      text-align: left;
     }
 
     .brand strong {
@@ -701,9 +721,42 @@ const HTML = String.raw`<!doctype html>
       font-size: 11px;
     }
 
+    .voice-picker {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(22, 30, 51, .75);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .voice-picker select {
+      background: transparent;
+      border: 0;
+      color: var(--text);
+      font: inherit;
+      font-weight: 600;
+      outline: none;
+      cursor: pointer;
+      padding-right: 2px;
+    }
+
+    .voice-picker select option {
+      background: #12182b;
+      color: var(--text);
+    }
+
+    .voice-picker select:disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
     .stage {
       flex: 0 0 auto;
-      padding-top: clamp(30px, 8vh, 78px);
+      padding-top: clamp(10px, 3.5vh, 45px);
       display: grid;
       justify-items: center;
       text-align: center;
@@ -782,8 +835,8 @@ const HTML = String.raw`<!doctype html>
     }
 
     .status {
-      margin-top: 42px;
-      min-height: 46px;
+      margin-top: clamp(12px, 2.8vh, 36px);
+      min-height: 44px;
     }
 
     .status-main {
@@ -793,14 +846,14 @@ const HTML = String.raw`<!doctype html>
     }
 
     .status-sub {
-      margin-top: 7px;
+      margin-top: 5px;
       color: var(--muted);
       font-size: 13px;
       line-height: 1.4;
     }
 
     .timer {
-      margin-top: 10px;
+      margin-top: 6px;
       min-height: 19px;
       color: #d7e0ff;
       font-variant-numeric: tabular-nums;
@@ -809,11 +862,10 @@ const HTML = String.raw`<!doctype html>
     }
 
     .captions {
-      flex: 1 1 auto;
-      min-height: 170px;
-      max-height: 34svh;
-      margin-top: 35px;
-      padding: 15px;
+      flex: 1 1 0;
+      min-height: 75px;
+      margin-top: clamp(10px, 2.5vh, 28px);
+      padding: 14px;
       overflow-y: auto;
       border: 1px solid var(--panel-border);
       border-radius: 20px;
@@ -822,7 +874,8 @@ const HTML = String.raw`<!doctype html>
     }
 
     .caption-empty {
-      min-height: 120px;
+      height: 100%;
+      min-height: 50px;
       display: grid;
       place-items: center;
       color: #8490b2;
@@ -874,10 +927,10 @@ const HTML = String.raw`<!doctype html>
 
     .controls {
       flex: 0 0 auto;
-      margin-top: 23px;
+      margin-top: clamp(12px, 2.2vh, 22px);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 14px;
+      gap: 12px;
       align-items: center;
     }
 
@@ -895,11 +948,11 @@ const HTML = String.raw`<!doctype html>
 
     .call-btn {
       grid-column: 1 / -1;
-      min-height: 68px;
-      border-radius: 22px;
+      min-height: 58px;
+      border-radius: 20px;
       background: linear-gradient(135deg, #3ece8a, #23a970);
       box-shadow: 0 13px 30px rgba(31, 189, 120, .25);
-      font-size: 18px;
+      font-size: 17px;
       font-weight: 760;
       transition: transform .15s ease, filter .15s ease;
     }
@@ -910,8 +963,8 @@ const HTML = String.raw`<!doctype html>
     }
 
     .round-btn {
-      min-height: 63px;
-      border-radius: 20px;
+      min-height: 54px;
+      border-radius: 18px;
       background: rgba(62, 77, 117, .8);
       border: 1px solid rgba(177, 199, 255, .11);
       color: #eff3ff;
@@ -931,49 +984,96 @@ const HTML = String.raw`<!doctype html>
 
     .hint {
       flex: 0 0 auto;
-      margin: 16px 5px 0;
+      margin: clamp(8px, 1.5vh, 14px) 5px 0;
       color: #7f8aaa;
       text-align: center;
       font-size: 11px;
-      line-height: 1.55;
+      line-height: 1.45;
     }
 
     [hidden] {
       display: none !important;
     }
 
-    @media (max-height: 720px) {
+    /* 针对手机及紧凑高度屏幕的自适应缩放 */
+    @media (max-height: 760px) {
       .stage {
-        padding-top: 28px;
+        padding-top: 8px;
       }
 
       .orb-wrap {
-        transform: scale(.82);
-        margin-bottom: -17px;
+        transform: scale(.78);
+        margin: -18px 0;
       }
 
       .status {
-        margin-top: 20px;
+        margin-top: 10px;
       }
 
-      .captions {
-        margin-top: 20px;
-        max-height: 26svh;
+      .status-main {
+        font-size: 19px;
       }
 
-      .controls {
-        margin-top: 16px;
+      .call-btn {
+        min-height: 52px;
+      }
+
+      .round-btn {
+        min-height: 48px;
+      }
+    }
+
+    @media (max-height: 620px) {
+      .orb-wrap {
+        transform: scale(.64);
+        margin: -30px 0;
+      }
+
+      .status {
+        margin-top: 6px;
+        min-height: 36px;
+      }
+
+      .timer {
+        margin-top: 2px;
+      }
+
+      .hint {
+        display: none;
+      }
+    }
+
+    /* 针对 iPad 等平板设备的舒适布局适配 */
+    @media (min-width: 768px) and (min-height: 820px) {
+      .shell {
+        width: min(100%, 600px);
+        padding-top: 28px;
+        padding-bottom: 28px;
       }
     }
   </style>
 </head>
-<body data-phase="idle" data-speaking="false">
+<body data-phase="idle" data-speaking="false" data-default-voice="__DEFAULT_VOICE__">
   <main class="shell">
     <header class="topbar">
       <div class="brand">
         <strong id="modelName">Gemini Live</strong>
-        <span>端到端加密连接由 Worker 代理</span>
+        <span>端到端加密连接由代理服务转发</span>
       </div>
+
+      <label class="voice-picker" for="voiceSelect">
+        <span>音色</span>
+        <select id="voiceSelect" aria-label="选择语音音色">
+          <option value="Puck">Puck (活泼男声)</option>
+          <option value="Charon">Charon (沉稳男声)</option>
+          <option value="Kore">Kore (自然女声)</option>
+          <option value="Fenrir">Fenrir (浑厚男声)</option>
+          <option value="Aoede">Aoede (温和女声)</option>
+          <option value="Leda">Leda (清亮女声)</option>
+          <option value="Orus">Orus (成熟男声)</option>
+          <option value="Zephyr">Zephyr (轻快女声)</option>
+        </select>
+      </label>
     </header>
 
     <section class="stage" aria-live="polite">
@@ -1015,10 +1115,10 @@ const HTML = String.raw`<!doctype html>
   </main>
 
   <script>
-    const AUTH_TOKEN = __AUTH_TOKEN_PLACEHOLDER__;
     const callButton = document.getElementById('callButton');
     const muteButton = document.getElementById('muteButton');
     const endButton = document.getElementById('endButton');
+    const voiceSelect = document.getElementById('voiceSelect');
 
     const orb = document.getElementById('orb');
     const statusMain = document.getElementById('statusMain');
@@ -1028,6 +1128,32 @@ const HTML = String.raw`<!doctype html>
 
     const captions = document.getElementById('captions');
     const captionEmpty = document.getElementById('captionEmpty');
+
+    // 初始化默认音色与本地记忆
+    (function initVoiceSelect() {
+      const serverDefault = document.body.dataset.defaultVoice || 'Kore';
+      const savedVoice = localStorage.getItem('gemini_live_voice') || serverDefault;
+
+      let exists = false;
+      for (let i = 0; i < voiceSelect.options.length; i++) {
+        if (voiceSelect.options[i].value === savedVoice) {
+          exists = true;
+          break;
+        }
+      }
+
+      if (!exists && savedVoice) {
+        const customOpt = document.createElement('option');
+        customOpt.value = savedVoice;
+        customOpt.textContent = savedVoice;
+        voiceSelect.appendChild(customOpt);
+      }
+
+      voiceSelect.value = savedVoice;
+      voiceSelect.addEventListener('change', function () {
+        localStorage.setItem('gemini_live_voice', voiceSelect.value);
+      });
+    })();
 
     let socket = null;
     let sessionReady = false;
@@ -1053,11 +1179,8 @@ const HTML = String.raw`<!doctype html>
 
     function workerWebSocketUrl() {
       const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
-      let wsUrl = scheme + location.host + '/ws';
-      if (AUTH_TOKEN) {
-        wsUrl += '?auth=' + encodeURIComponent(AUTH_TOKEN);
-      }
-      return wsUrl;
+      const voice = encodeURIComponent(voiceSelect.value || 'Kore');
+      return scheme + location.host + '/ws?voice=' + voice;
     }
 
     function setPhase(phase) {
@@ -1085,6 +1208,7 @@ const HTML = String.raw`<!doctype html>
       callButton.hidden = active;
       endButton.disabled = !active;
       muteButton.disabled = !sessionReady;
+      voiceSelect.disabled = active;
 
       muteButton.classList.toggle('muted', muted);
       muteButton.textContent = muted ? '🔇　取消静音' : '🎙　静音';
@@ -1372,7 +1496,7 @@ const HTML = String.raw`<!doctype html>
       addNote('正在请求麦克风权限并呼叫 Gemini…');
 
       setPhase('dialing');
-      setStatus('正在拨号…', '正在连接 Worker 和 Gemini。');
+      setStatus('正在拨号…', '正在连接服务器和 Gemini。');
       refreshButtons();
 
       try {
@@ -1401,7 +1525,7 @@ const HTML = String.raw`<!doctype html>
       connectTimer = setTimeout(function () {
         if (socket === ws && !sessionReady) {
           lastFailure =
-            '连接等待超过 20 秒。请检查 Worker 环境变量或查看 wrangler tail 日志。';
+            '连接等待超过 20 秒。请检查环境变量配置或查看服务器日志。';
           ws.close(1011, 'connection timeout');
         }
       }, 20_000);
@@ -1411,7 +1535,7 @@ const HTML = String.raw`<!doctype html>
 
         setStatus(
           '正在接通…',
-          'Worker 已连接，正在创建 Gemini Live 会话。',
+          '服务器已连接，正在创建 Gemini Live 会话。',
         );
       });
 
@@ -1423,7 +1547,7 @@ const HTML = String.raw`<!doctype html>
         try {
           message = JSON.parse(event.data);
         } catch {
-          lastFailure = 'Worker 返回了无法解析的消息。';
+          lastFailure = '服务器返回了无法解析的消息。';
           return;
         }
 
@@ -1434,7 +1558,7 @@ const HTML = String.raw`<!doctype html>
         if (socket !== ws) return;
 
         lastFailure =
-          '浏览器与 Worker 的 WebSocket 连接发生错误。';
+          '浏览器与服务器的 WebSocket 连接发生错误。';
       });
 
       ws.addEventListener('close', function (event) {
@@ -1537,7 +1661,7 @@ const HTML = String.raw`<!doctype html>
 
         setPhase('connected');
         setStatus('通话中', '正在聆听。');
-        addNote('已接通。现在可以自然说话。');
+        addNote('已接通（音色：' + voiceSelect.value + '）。现在可以自然说话。');
 
         startDurationTimer();
         refreshButtons();
@@ -1682,6 +1806,7 @@ const HTML = String.raw`<!doctype html>
         source.buffer = buffer;
         source.connect(ctx.destination);
 
+        // 优化播放排队调度：消除多余的 25ms 缓冲延迟，避免时间戳落后导致累积延迟
         const now = ctx.currentTime;
         if (nextPlayTime < now) {
           nextPlayTime = now;
@@ -1824,3 +1949,7 @@ const HTML = String.raw`<!doctype html>
   </script>
 </body>
 </html>`;
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[Gemini Live Server] Listening on port ${PORT}`);
+});
