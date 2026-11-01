@@ -79,17 +79,10 @@ app.use((req, res, next) => {
   next();
 });
 
-/*
- * Render 健康检查不需要密码，否则新实例会因为 401 无法通过健康检查。
- */
 app.get("/healthz", (_req, res) => {
   res.type("text/plain; charset=UTF-8").send("ok");
 });
 
-/*
- * 前端读取允许选择的声音列表。
- * 不返回 GEMINI_API_KEY、系统提示词等任何敏感配置。
- */
 app.get("/config", requireHttpAuth, (_req, res) => {
   res.json({
     defaultVoice: getDefaultVoice(),
@@ -97,10 +90,6 @@ app.get("/config", requireHttpAuth, (_req, res) => {
   });
 });
 
-/*
- * 主页：保留原来的 ?pwd= 访问方式。
- * 访问成功时写入 HttpOnly Cookie，后续 WebSocket 会自动携带。
- */
 app.get("/", requireHttpAuth, (req, res) => {
   const expectedPassword = getAccessPassword();
 
@@ -134,16 +123,12 @@ const wss = new WebSocketServer({
   noServer: true,
   clientTracking: true,
   maxPayload: 256 * 1024,
-  perMessageDeflate: false, // 禁用压缩，降低实时语音 CPU 延迟
+  perMessageDeflate: false,
 });
 
-/*
- * 浏览器端 WS 已连接后的处理。
- */
 wss.on("connection", (browser, request) => {
   browser.isAlive = true;
 
-  // 禁用 Nagle 算法，让每一帧小音频包立即发出，降低网络抖动延迟
   if (browser._socket && typeof browser._socket.setNoDelay === "function") {
     browser._socket.setNoDelay(true);
   }
@@ -154,16 +139,13 @@ wss.on("connection", (browser, request) => {
 
   const url = getRequestUrl(request);
   const selectedVoice = url.searchParams.get("voice") || "";
-  const clientMemory = url.searchParams.get("memory") || ""; // <-- 新增这一行
+  const clientMemory = url.searchParams.get("memory") || "";
 
-  const bridge = createGeminiBridge(browser, selectedVoice, clientMemory); // <-- 传入 clientMemory
+  const bridge = createGeminiBridge(browser, selectedVoice, clientMemory);
   bridge.install();
   void bridge.connect();
 });
 
-/*
- * Render / WebSocket 升级入口。
- */
 server.on("upgrade", (request, socket, head) => {
   socket.setNoDelay(true);
 
@@ -191,10 +173,6 @@ server.on("upgrade", (request, socket, head) => {
   });
 });
 
-/*
- * Render 官方建议对长连接做 ping/pong。
- * 这里会主动清理已经断开的浏览器 WebSocket。
- */
 const heartbeatTimer = setInterval(() => {
   for (const client of wss.clients) {
     if (client.isAlive === false) {
@@ -310,7 +288,6 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
         return;
       }
 
-      // 禁用上游 TCP Nagle 缓冲，降低往返延迟
       if (upstream._socket && typeof upstream._socket.setNoDelay === "function") {
         upstream._socket.setNoDelay(true);
       }
@@ -324,7 +301,7 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
       });
 
       try {
-        upstream.send(JSON.stringify((config, clientMemory)));
+        upstream.send(JSON.stringify(createSetupMessage(config, clientMemory)));
       } catch (error) {
         fail("无法发送 Gemini setup 消息：" + errorMessage(error));
         return;
@@ -458,10 +435,6 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
         return;
       }
 
-      /*
-       * 网络短暂堵塞时直接丢弃过旧的实时音频，
-       * 不让 Node 进程和 Gemini 上游不断积压。
-       */
       if (upstream.bufferedAmount > 256 * 1024) {
         return;
       }
@@ -562,10 +535,6 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
   };
 }
 
-/*
- * 支持在 GEMINI_API_KEY 中用英文逗号配置多个 Key（如 key1,key2,key3），
- * 多台设备同时通话时自动轮询分配，突破免费单 Key 并发上限。
- */
 function pickGeminiApiKey() {
   const raw = requiredEnv("GEMINI_API_KEY");
   const keys = raw
@@ -686,7 +655,6 @@ function createSetupMessage(config, clientMemory = "") {
 
   if (config.voice) {
     generationConfig.speechConfig = {
-      languageCode: "en-US",
       voiceConfig: {
         prebuiltVoiceConfig: {
           voiceName: config.voice,
@@ -697,12 +665,12 @@ function createSetupMessage(config, clientMemory = "") {
 
   let finalPrompt =
     config.systemPrompt +
-    "\n\n[CRITICAL AUDIO & SHORT-WORD RULES:\n" +
-    "1. Short utterances like 'Pardon?', 'What?', 'Huh?', 'Sorry?', 'Yeah', 'No', 'Wait' are ALWAYS English. NEVER interpret 'Pardon' as French or any other language.\n" +
-    "2. Ignore background noise. Use conversation context to accurately understand the child's English or Mandarin Chinese speech.\n" +
-    "3. You are Physically Unable to speak any language other than English (and brief Mandarin Chinese when helping).]";
+    "\n\n[STRICT AUDIO & LANGUAGE RULES:\n" +
+    "1. Always respond immediately with spoken English audio stream.\n" +
+    "2. The user is ONLY speaking English or Mandarin Chinese. NEVER interpret any audio (such as 'Pardon?', 'What?', 'Huh?', or background noise) as French, Spanish, Russian, Arabic, or any other third language.\n" +
+    "3. If audio is unclear, politely ask in English: 'Could you say that again?']";
 
-  const cleanMemory = String(clientMemory || "").trim().slice(0, 1500);
+  const cleanMemory = String(clientMemory || "").trim().slice(0, 1200);
   if (cleanMemory) {
     finalPrompt +=
       "\n\n[PAST MEMORY LOG (Recent conversation history with this child from previous calls)]:\n" +
@@ -720,23 +688,9 @@ function createSetupMessage(config, clientMemory = "") {
           },
         ],
       },
-      // 突破 15 分钟限制
+      // 官方标准滑动窗口压缩：突破 15 分钟音频会话时长限制
       contextWindowCompression: {
         slidingWindow: {},
-      },
-      /*
-       * 核心修复：防吞字配置！
-       * 1. startOfSpeechSensitivity 设为 HIGH，确保轻音字头（p, t, s, th 等）第一时间被捕捉；
-       * 2. prefixPaddingMs: 300，在检测到开口前自动往前多取 300 毫秒音频，绝不漏掉第一个词！
-       * 3. silenceDurationMs: 700，给孩子句中思考留出 0.7 秒余地，不会话说一半就被截断。
-       */
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
-          endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-          prefixPaddingMs: 300,
-          silenceDurationMs: 700,
-        },
       },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
@@ -1223,7 +1177,6 @@ const HTML = String.raw`<!doctype html>
       letter-spacing: .08em;
     }
 
-    /* 折叠/展开字幕控制栏 */
     .caption-drawer {
       flex: 0 1 auto;
       display: flex;
@@ -1386,7 +1339,6 @@ const HTML = String.raw`<!doctype html>
       display: none !important;
     }
 
-    /* 当字幕展开且屏幕较矮时自动缩小光球，绝不挤压底部按钮 */
     @media (max-height: 760px) {
       body[data-captions="open"] .orb-wrap {
         transform: scale(.74);
@@ -1511,7 +1463,6 @@ const HTML = String.raw`<!doctype html>
     const captions = document.getElementById('captions');
     const captionEmpty = document.getElementById('captionEmpty');
 
-    // 字幕折叠与展开切换（默认收起）
     let captionsExpanded = false;
     captionToggle.addEventListener('click', function () {
       captionsExpanded = !captionsExpanded;
@@ -1524,7 +1475,6 @@ const HTML = String.raw`<!doctype html>
       }
     });
 
-    // 从后端 /config 加载完整音色列表
     async function loadVoiceConfig() {
       try {
         const res = await fetch('/config');
@@ -1578,17 +1528,17 @@ const HTML = String.raw`<!doctype html>
     let activeInputLine = null;
     let activeOutputLine = null;
 
-    // 提取最近 16 条对话存入浏览器本地作为跨天记忆
     function saveConversationMemory() {
       try {
         const lines = captions.querySelectorAll('.line.me, .line.assistant');
         if (lines.length < 2) return;
 
         const recent = [];
-        const startIdx = Math.max(0, lines.length - 12);
+        const startIdx = Math.max(0, lines.length - 10);
         for (let i = startIdx; i < lines.length; i++) {
           const role = lines[i].classList.contains('me') ? 'Child' : 'Tutor';
-          const text = lines[i].querySelector('.text')?.textContent?.trim() || '';
+          const textEl = lines[i].querySelector('.text');
+          const text = textEl ? textEl.textContent.trim() : '';
           if (text) {
             recent.push(role + ': ' + text);
           }
@@ -1597,8 +1547,7 @@ const HTML = String.raw`<!doctype html>
         if (recent.length > 0) {
           const prev = localStorage.getItem('gemini_child_memory') || '';
           const combined = (prev ? prev + '\n---\n' : '') + recent.join('\n');
-          // 只保留最近 1200 个字符，防止 URL 过长，永远滚动更新最新记忆
-          localStorage.setItem('gemini_child_memory', combined.slice(-1200));
+          localStorage.setItem('gemini_child_memory', combined.slice(-800));
         }
       } catch {}
     }
@@ -1754,9 +1703,7 @@ const HTML = String.raw`<!doctype html>
           throw new Error('当前浏览器不支持 Web Audio API。');
         }
 
-        audioContext = new AudioContextClass({
-          latencyHint: 'interactive',
-        });
+        audioContext = new AudioContextClass();
       }
 
       if (audioContext.state === 'suspended') {
@@ -1805,18 +1752,12 @@ const HTML = String.raw`<!doctype html>
       micSource = ctx.createMediaStreamSource(mediaStream);
 
       /*
-       * 采集优化：
-       * 1. 增加 4 帧（约 85ms）前置环形缓冲（Pre-roll Buffer），说话开口前的气音和辅音完整保留，绝不吞字头！
-       * 2. 阈值降至极柔和的 0.0045，静音期不断崖切零，而是衰减到 15% 底噪，让 Gemini 的音频模型保持自然声学基底。
-       * 3. 加入 1.6 倍人声柔和放大（Soft Gain），孩子离 iPad/手机稍远也能字字清晰。
+       * 恢复 100% 原始无损麦克风采集（不做任何人为切零或噪音门限截断），
+       * 确保每一个单词的轻音字头和尾音都完整传给 Gemini，解决录入错误问题。
        */
       micProcessor = ctx.createScriptProcessor(2048, 1, 1);
       silentMicSink = ctx.createGain();
       silentMicSink.gain.value = 0;
-
-      let speechHoldFrames = 0;
-      const SOFT_GATE_THRESHOLD = 0.0045; // 极柔和门限，不吃轻辅音
-      const VOICE_GAIN = 1.6; // 人声清晰度增益放大
 
       micProcessor.onaudioprocess = function (event) {
         const input = event.inputBuffer.getChannelData(0);
@@ -1839,24 +1780,8 @@ const HTML = String.raw`<!doctype html>
           return;
         }
 
-        if (level >= SOFT_GATE_THRESHOLD) {
-          speechHoldFrames = 18; // 说话后保持约 0.8 秒完整收音
-        } else if (speechHoldFrames > 0) {
-          speechHoldFrames--;
-        }
-
-        // 处理音频帧：说话时自动放大音量提高识别率；完全安静时仅压低底噪（不断流、不切零）
-        const processedFrame = new Float32Array(input.length);
-        const multiplier = speechHoldFrames > 0 ? VOICE_GAIN : 0.15;
-
-        for (let i = 0; i < input.length; i++) {
-          // 软限幅防破音
-          const boosted = input[i] * multiplier;
-          processedFrame[i] = Math.max(-1, Math.min(1, boosted));
-        }
-
         const pcm16 = downsampleFloat32ToPcm16(
-          processedFrame,
+          input,
           ctx.sampleRate,
           16000,
         );
@@ -2009,9 +1934,9 @@ const HTML = String.raw`<!doctype html>
       });
 
       ws.addEventListener('close', function (event) {
-        saveConversationMemory();
         if (socket !== ws) return;
 
+        saveConversationMemory();
         clearConnectTimer();
 
         const endedByUser = manuallyEnded;
@@ -2255,11 +2180,6 @@ const HTML = String.raw`<!doctype html>
         source.buffer = buffer;
         source.connect(ctx.destination);
 
-        /*
-         * 35ms 首包抗抖动微缓冲：
-         * 当队列为空（首包到达）时预留 35ms 缓冲窗口，防止非热音色第 1 帧与第 2 帧之间断流；
-         * 后续连续帧紧密无缝拼接。
-         */
         const now = ctx.currentTime;
         if (nextPlayTime <= now) {
           nextPlayTime = now + 0.035;
