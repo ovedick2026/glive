@@ -1,5 +1,9 @@
-import http from "node:http";
-import { WebSocketServer, WebSocket } from "ws";
+import "dotenv/config";
+
+import express from "express";
+import { timingSafeEqual } from "node:crypto";
+import { createServer } from "node:http";
+import { WebSocket, WebSocketServer } from "ws";
 
 const DEFAULT_GEMINI_WS_URL =
   "wss://generativelanguage.googleapis.com/ws/" +
@@ -7,73 +11,54 @@ const DEFAULT_GEMINI_WS_URL =
 
 const DEFAULT_MODEL = "gemini-3.8-live";
 const SETUP_TIMEOUT_MS = 15_000;
-const PORT = process.env.PORT || 3000;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
-function checkAuth(req, url, env) {
-  if (!env.ACCESS_PASSWORD) return true;
+let apiKeyRoundRobinIndex = 0;
 
-  const expectedPassword = String(env.ACCESS_PASSWORD).trim();
-  const cookieHeader = req.headers["cookie"] || "";
-  const cookieAuth = cookieHeader.match(/(?:^|;\s*)auth=([^;]+)/)?.[1];
-  const queryPwd = url.searchParams.get("pwd");
-  const authHeader = req.headers["authorization"];
+const VOICE_CATALOG = [
+  { name: "Kore", label: "Kore · 坚定 (极速)" },
+  { name: "Puck", label: "Puck · 活泼 (极速)" },
+  { name: "Leda", label: "Leda · 年轻 (极速)" },
+  { name: "Aoede", label: "Aoede · 轻快" },
+  { name: "Charon", label: "Charon · 知性" },
+  { name: "Fenrir", label: "Fenrir · 热情" },
+  { name: "Orus", label: "Orus · 稳重" },
+  { name: "Zephyr", label: "Zephyr · 明亮" },
+  { name: "Callirrhoe", label: "Callirrhoe · 随和" },
+  { name: "Autonoe", label: "Autonoe · 明亮" },
+  { name: "Enceladus", label: "Enceladus · 气声" },
+  { name: "Iapetus", label: "Iapetus · 清晰" },
+  { name: "Umbriel", label: "Umbriel · 随和" },
+  { name: "Algieba", label: "Algieba · 柔和" },
+  { name: "Despina", label: "Despina · 柔和" },
+  { name: "Erinome", label: "Erinome · 清晰" },
+  { name: "Algenib", label: "Algenib · 沙哑" },
+  { name: "Rasalgethi", label: "Rasalgethi · 知性" },
+  { name: "Laomedeia", label: "Laomedeia · 活泼" },
+  { name: "Achernar", label: "Achernar · 柔和" },
+  { name: "Alnilam", label: "Alnilam · 坚定" },
+  { name: "Schedar", label: "Schedar · 平稳" },
+  { name: "Gacrux", label: "Gacrux · 成熟" },
+  { name: "Pulcherrima", label: "Pulcherrima · 直接" },
+  { name: "Achird", label: "Achird · 友好" },
+  { name: "Zubenelgenubi", label: "Zubenelgenubi · 随和" },
+  { name: "Vindemiatrix", label: "Vindemiatrix · 温和" },
+  { name: "Sadachbia", label: "Sadachbia · 活泼" },
+  { name: "Sadaltager", label: "Sadaltager · 博学" },
+  { name: "Sulafat", label: "Sulafat · 温暖" },
+];
 
-  if (queryPwd && queryPwd === expectedPassword) {
-    return true;
-  }
-  if (cookieAuth && decodeURIComponent(cookieAuth) === expectedPassword) {
-    return true;
-  }
-  if (authHeader && authHeader.startsWith("Basic ")) {
-    try {
-      const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
-      const inputPwd = decoded.includes(":") ? decoded.split(":")[1] : decoded;
-      if (inputPwd === expectedPassword || decoded === expectedPassword) {
-        return true;
-      }
-    } catch {}
-  }
+const voiceLabelMap = new Map(
+  VOICE_CATALOG.map((voice) => [voice.name, voice.label]),
+);
 
-  return false;
-}
+const app = express();
+const server = createServer(app);
 
-function getRequestUrl(req) {
-  const proto = req.headers["x-forwarded-proto"]
-    ? String(req.headers["x-forwarded-proto"]).split(",")[0].trim()
-    : "http";
-  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
-  return new URL(req.url || "/", `${proto}://${host}`);
-}
+app.disable("x-powered-by");
 
-const server = http.createServer((req, res) => {
-  const env = process.env;
-  const url = getRequestUrl(req);
-
-  // Render 健康检查接口
-  if (url.pathname === "/healthz") {
-    res.writeHead(200, { "content-type": "text/plain; charset=UTF-8" });
-    res.end("OK");
-    return;
-  }
-
-  // 密码访问验证：配置了 ACCESS_PASSWORD 时生效，防止未授权消耗额度
-  if (!checkAuth(req, url, env)) {
-    res.writeHead(401, {
-      "WWW-Authenticate": 'Basic realm="Gemini Live Voice"',
-      "content-type": "text/plain; charset=UTF-8",
-    });
-    res.end("Unauthorized");
-    return;
-  }
-
-  if (url.pathname !== "/" || req.method !== "GET") {
-    res.writeHead(404, { "content-type": "text/plain; charset=UTF-8" });
-    res.end("Not Found");
-    return;
-  }
-
-  const headers = {
-    "content-type": "text/html; charset=UTF-8",
+app.use((req, res, next) => {
+  res.set({
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
@@ -82,71 +67,157 @@ const server = http.createServer((req, res) => {
       "default-src 'self'",
       "style-src 'unsafe-inline'",
       "script-src 'unsafe-inline'",
-      "connect-src 'self' wss: ws:",
+      "connect-src 'self' ws: wss:",
       "media-src 'self' blob:",
       "img-src 'self' data:",
       "base-uri 'none'",
       "form-action 'self'",
       "frame-ancestors 'none'",
     ].join("; "),
-  };
+  });
 
-  // 如果通过 ?pwd= 访问成功，顺便写入 Cookie 供后续和 WebSocket 免密使用
-  if (env.ACCESS_PASSWORD && url.searchParams.get("pwd") === String(env.ACCESS_PASSWORD).trim()) {
-    headers["set-cookie"] = `auth=${encodeURIComponent(env.ACCESS_PASSWORD)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`;
-  }
-
-  const defaultVoice = String(env.GEMINI_VOICE || "Kore").trim();
-  const pageHtml = HTML.replace("__DEFAULT_VOICE__", defaultVoice);
-
-  res.writeHead(200, headers);
-  res.end(pageHtml);
+  next();
 });
 
-const wss = new WebSocketServer({ noServer: true });
+/*
+ * Render 健康检查不需要密码，否则新实例会因为 401 无法通过健康检查。
+ */
+app.get("/healthz", (_req, res) => {
+  res.type("text/plain; charset=UTF-8").send("ok");
+});
 
-server.on("upgrade", (req, socket, head) => {
-  const env = process.env;
-  const url = getRequestUrl(req);
-
-  if (url.pathname !== "/ws") {
-    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-
-  if (!checkAuth(req, url, env)) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-
-  /*
-   * WebSocket 并不受普通 CORS 保护。
-   * 默认只允许当前页面所在 Origin 发起连接。
-   *
-   * 如使用自定义域名，可显式设置：
-   * ALLOWED_ORIGIN=https://voice.example.com
-   */
-  const requestOrigin = req.headers["origin"];
-  const allowedOrigin = String(env.ALLOWED_ORIGIN || url.origin).replace(/\/$/, "");
-
-  if (!requestOrigin || requestOrigin !== allowedOrigin) {
-    socket.write("HTTP/1.1 403 Forbidden WebSocket origin\r\n\r\n");
-    socket.destroy();
-    return;
-  }
-
-  const requestedVoice = url.searchParams.get("voice") || "";
-
-  wss.handleUpgrade(req, socket, head, (browser) => {
-    const bridge = createGeminiBridge(browser, env, requestedVoice);
-    bridge.install();
-    void bridge.connect();
+/*
+ * 前端读取允许选择的声音列表。
+ * 不返回 GEMINI_API_KEY、系统提示词等任何敏感配置。
+ */
+app.get("/config", requireHttpAuth, (_req, res) => {
+  res.json({
+    defaultVoice: getDefaultVoice(),
+    voices: getVoiceOptions(),
   });
 });
 
-function createGeminiBridge(browser, env, requestedVoice) {
+/*
+ * 主页：保留原来的 ?pwd= 访问方式。
+ * 访问成功时写入 HttpOnly Cookie，后续 WebSocket 会自动携带。
+ */
+app.get("/", requireHttpAuth, (req, res) => {
+  const expectedPassword = getAccessPassword();
+
+  if (expectedPassword && queryPasswordMatches(req, expectedPassword)) {
+    const secure = isHttpsRequest(req) ? "; Secure" : "";
+
+    res.append(
+      "set-cookie",
+      `auth=${encodeURIComponent(expectedPassword)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${secure}`,
+    );
+  }
+
+  res.type("text/html; charset=UTF-8").send(HTML);
+});
+
+app.use((req, res) => {
+  res.status(404).type("text/plain; charset=UTF-8").send("Not Found");
+});
+
+app.use((error, _req, res, _next) => {
+  console.error("[HTTP]", error);
+
+  if (res.headersSent) {
+    return;
+  }
+
+  res.status(500).type("text/plain; charset=UTF-8").send("Internal Server Error");
+});
+
+const wss = new WebSocketServer({
+  noServer: true,
+  clientTracking: true,
+  maxPayload: 256 * 1024,
+  perMessageDeflate: false, // 禁用压缩，降低实时语音 CPU 延迟
+});
+
+/*
+ * 浏览器端 WS 已连接后的处理。
+ */
+wss.on("connection", (browser, request) => {
+  browser.isAlive = true;
+
+  // 禁用 Nagle 算法，让每一帧小音频包立即发出，降低网络抖动延迟
+  if (browser._socket && typeof browser._socket.setNoDelay === "function") {
+    browser._socket.setNoDelay(true);
+  }
+
+  browser.on("pong", function heartbeat() {
+    this.isAlive = true;
+  });
+
+  const url = getRequestUrl(request);
+  const selectedVoice = url.searchParams.get("voice") || "";
+
+  const bridge = createGeminiBridge(browser, selectedVoice);
+  bridge.install();
+  void bridge.connect();
+});
+
+/*
+ * Render / WebSocket 升级入口。
+ */
+server.on("upgrade", (request, socket, head) => {
+  socket.setNoDelay(true);
+
+  const url = getRequestUrl(request);
+
+  if (url.pathname !== "/ws") {
+    rejectUpgrade(socket, 404, "Not Found");
+    return;
+  }
+
+  if (!isRequestAuthorized(request)) {
+    rejectUpgrade(socket, 401, "Unauthorized", {
+      "WWW-Authenticate": 'Basic realm="Gemini Live Voice"',
+    });
+    return;
+  }
+
+  if (!isAllowedWebSocketOrigin(request)) {
+    rejectUpgrade(socket, 403, "Forbidden WebSocket origin");
+    return;
+  }
+
+  wss.handleUpgrade(request, socket, head, (browser) => {
+    wss.emit("connection", browser, request);
+  });
+});
+
+/*
+ * Render 官方建议对长连接做 ping/pong。
+ * 这里会主动清理已经断开的浏览器 WebSocket。
+ */
+const heartbeatTimer = setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+
+    client.isAlive = false;
+
+    try {
+      client.ping();
+    } catch {
+      client.terminate();
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
+heartbeatTimer.unref();
+
+wss.on("close", () => {
+  clearInterval(heartbeatTimer);
+});
+
+function createGeminiBridge(browser, selectedVoice) {
   let upstream = null;
   let phase = "connecting"; // connecting | setting-up | ready | closed
   let closed = false;
@@ -169,20 +240,13 @@ function createGeminiBridge(browser, env, requestedVoice) {
     if (!socket) return;
 
     try {
-      if (
-        socket.readyState === WebSocket.CONNECTING ||
-        socket.readyState === WebSocket.OPEN ||
-        socket.readyState === WebSocket.CLOSING
-      ) {
-        const safeCode =
-          typeof code === "number" &&
-          (code === 1000 || (code >= 3000 && code <= 4999) || code === 1011)
-            ? code
-            : 1000;
-        socket.close(safeCode, reason.slice(0, 120));
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close(code, reason.slice(0, 120));
+      } else if (socket.readyState === WebSocket.CONNECTING) {
+        socket.terminate();
       }
     } catch {
-      // 连接关闭阶段忽略异常。
+      // 关闭阶段忽略异常。
     }
   }
 
@@ -200,17 +264,13 @@ function createGeminiBridge(browser, env, requestedVoice) {
   function fail(message) {
     if (closed) return;
 
-    console.error("[Gemini Live Server]", message);
+    console.error("[Gemini Live Render]", message);
 
     sendToBrowser({
       type: "error",
       message,
     });
 
-    /*
-     * 先 send 错误帧，再 close。
-     * 浏览器可以显示出错信息，随后允许用户重新拨号。
-     */
     closeEverything(1011, "Gemini Live connection failed");
   }
 
@@ -218,7 +278,7 @@ function createGeminiBridge(browser, env, requestedVoice) {
     let config;
 
     try {
-      config = getGeminiConfig(env, requestedVoice);
+      config = getGeminiConfig(selectedVoice);
     } catch (error) {
       fail(errorMessage(error));
       return;
@@ -231,36 +291,27 @@ function createGeminiBridge(browser, env, requestedVoice) {
     });
 
     try {
-      upstream = new WebSocket(config.wsUrl);
-      upstream.binaryType = "arraybuffer";
+      upstream = new WebSocket(config.webSocketUrl, {
+        handshakeTimeout: SETUP_TIMEOUT_MS,
+        maxPayload: 2 * 1024 * 1024,
+        perMessageDeflate: false,
+      });
     } catch (error) {
       fail("无法建立到 Gemini 的 WebSocket 连接：" + errorMessage(error));
       return;
     }
 
-    upstream.on("unexpected-response", (req, res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => {
-        body += chunk;
-      });
-      res.on("end", () => {
-        const detail = parseErrorText(body);
-        fail(
-          "Gemini WebSocket 握手失败（HTTP " +
-            res.statusCode +
-            "）" +
-            (detail ? "：" + detail : ""),
-        );
-      });
-    });
+    upstream.binaryType = "arraybuffer";
 
-    upstream.addEventListener("open", () => {
+    upstream.once("open", () => {
       if (closed) {
-        try {
-          upstream.close(1000, "browser already closed");
-        } catch {}
+        closeSocket(upstream, 1000, "browser already closed");
         return;
+      }
+
+      // 禁用上游 TCP Nagle 缓冲，降低往返延迟
+      if (upstream._socket && typeof upstream._socket.setNoDelay === "function") {
+        upstream._socket.setNoDelay(true);
       }
 
       phase = "setting-up";
@@ -281,67 +332,92 @@ function createGeminiBridge(browser, env, requestedVoice) {
       setupTimer = setTimeout(() => {
         if (phase === "setting-up" && !closed) {
           fail(
-            "等待 Gemini setupComplete 超时（15 秒）。请检查 GEMINI_API_KEY、GEMINI_WS_URL、模型权限或服务器日志。",
+            "等待 Gemini setupComplete 超时（15 秒）。请检查 GEMINI_API_KEY、GEMINI_WS_URL、模型权限或 Render 日志。",
           );
         }
       }, SETUP_TIMEOUT_MS);
     });
 
-    upstream.addEventListener("message", (event) => {
-      void handleGeminiMessage(event);
+    upstream.on("message", (data) => {
+      void handleGeminiMessage(data);
     });
 
-    upstream.addEventListener("error", () => {
+    upstream.on("error", (error) => {
       if (!closed) {
         fail(
-          "Gemini 上游 WebSocket 出错。请检查 API Key、模型权限、Endpoint 和网络。",
+          "Gemini 上游 WebSocket 出错：" +
+            errorMessage(error) +
+            "。请检查 API Key、模型权限、Endpoint 和网络。",
         );
       }
     });
 
-    upstream.addEventListener("close", (event) => {
+    upstream.on("unexpected-response", (_request, response) => {
+      let detail = "";
+
+      response.on("data", (chunk) => {
+        if (detail.length < 500) {
+          detail += Buffer.from(chunk).toString("utf8");
+        }
+      });
+
+      response.on("end", () => {
+        const cleanDetail = detail.replace(/\s+/g, " ").trim().slice(0, 500);
+
+        fail(
+          "Gemini WebSocket 握手失败（HTTP " +
+            response.statusCode +
+            "）" +
+            (cleanDetail ? "：" + cleanDetail : ""),
+        );
+      });
+    });
+
+    upstream.on("close", (code, reasonBuffer) => {
       if (closed) return;
 
-      const reason = event.reason
-        ? "Gemini 已关闭连接：" + event.reason
-        : "Gemini 已关闭连接（代码 " + event.code + "）";
+      const reason = Buffer.isBuffer(reasonBuffer)
+        ? reasonBuffer.toString("utf8")
+        : String(reasonBuffer || "");
+
+      const message = reason
+        ? "Gemini 已关闭连接：" + reason
+        : "Gemini 已关闭连接（代码 " + code + "）";
 
       sendToBrowser({
         type: "closed",
-        code: event.code,
-        message: reason,
+        code,
+        message,
       });
 
       closeEverything(
-        event.code === 1000 ? 1000 : 1011,
+        code === 1000 ? 1000 : 1011,
         "Gemini upstream closed",
       );
     });
   }
 
   function install() {
-    browser.binaryType = "arraybuffer";
-
-    browser.addEventListener("message", (event) => {
-      void handleBrowserMessage(event);
+    browser.on("message", (data) => {
+      void handleBrowserMessage(data);
     });
 
-    browser.addEventListener("error", () => {
+    browser.on("error", () => {
       closeEverything(1011, "browser websocket error");
     });
 
-    browser.addEventListener("close", () => {
+    browser.on("close", () => {
       closeEverything(1000, "browser closed");
     });
   }
 
-  async function handleBrowserMessage(event) {
+  async function handleBrowserMessage(data) {
     if (closed) return;
 
     let message;
 
     try {
-      message = JSON.parse(await wsDataToText(event.data));
+      message = JSON.parse(await wsDataToText(data));
     } catch {
       sendToBrowser({
         type: "error",
@@ -369,10 +445,6 @@ function createGeminiBridge(browser, env, requestedVoice) {
     if (message.type === "audio") {
       const audioData = typeof message.data === "string" ? message.data : "";
 
-      /*
-       * 浏览器每次发的是几十毫秒 PCM，正常远小于这个限制。
-       * 防止异常客户端向服务器 / 上游推送超大消息。
-       */
       if (
         !audioData ||
         audioData.length > 128 * 1024 ||
@@ -385,28 +457,44 @@ function createGeminiBridge(browser, env, requestedVoice) {
         return;
       }
 
-      upstream.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: {
-              data: audioData,
-              mimeType: "audio/pcm;rate=16000",
+      /*
+       * 网络短暂堵塞时直接丢弃过旧的实时音频，
+       * 不让 Node 进程和 Gemini 上游不断积压。
+       */
+      if (upstream.bufferedAmount > 256 * 1024) {
+        return;
+      }
+
+      try {
+        upstream.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data: audioData,
+                mimeType: "audio/pcm;rate=16000",
+              },
             },
-          },
-        }),
-      );
+          }),
+        );
+      } catch (error) {
+        fail("无法转发麦克风音频：" + errorMessage(error));
+      }
 
       return;
     }
 
     if (message.type === "audioEnd") {
-      upstream.send(
-        JSON.stringify({
-          realtimeInput: {
-            audioStreamEnd: true,
-          },
-        }),
-      );
+      try {
+        upstream.send(
+          JSON.stringify({
+            realtimeInput: {
+              audioStreamEnd: true,
+            },
+          }),
+        );
+      } catch (error) {
+        fail("无法发送音频结束信号：" + errorMessage(error));
+      }
 
       return;
     }
@@ -417,13 +505,13 @@ function createGeminiBridge(browser, env, requestedVoice) {
     });
   }
 
-  async function handleGeminiMessage(event) {
+  async function handleGeminiMessage(data) {
     if (closed) return;
 
     let raw;
 
     try {
-      raw = await wsDataToText(event.data);
+      raw = await wsDataToText(data);
     } catch (error) {
       fail("无法读取 Gemini 上游消息：" + errorMessage(error));
       return;
@@ -438,9 +526,6 @@ function createGeminiBridge(browser, env, requestedVoice) {
       return;
     }
 
-    /*
-     * setupComplete 是真正可开始传输音频的信号。
-     */
     if (
       packet &&
       Object.prototype.hasOwnProperty.call(packet, "setupComplete")
@@ -450,14 +535,10 @@ function createGeminiBridge(browser, env, requestedVoice) {
 
       sendToBrowser({
         type: "ready",
-        model: getSafeModelName(env),
+        model: getSafeModelName(),
       });
     }
 
-    /*
-     * 让页面直接显示 Gemini 返回的顶层错误，
-     * 不再像旧版那样静默卡在“初始化中”。
-     */
     if (packet && packet.error) {
       const message =
         packet.error.message ||
@@ -480,20 +561,36 @@ function createGeminiBridge(browser, env, requestedVoice) {
   };
 }
 
-function getGeminiConfig(env, requestedVoice) {
-  const apiKey = requiredEnv(env, "GEMINI_API_KEY");
-  const systemPrompt = requiredEnv(env, "GEMINI_SYSTEM_PROMPT");
+/*
+ * 支持在 GEMINI_API_KEY 中用英文逗号配置多个 Key（如 key1,key2,key3），
+ * 多台设备同时通话时自动轮询分配，突破免费单 Key 并发上限。
+ */
+function pickGeminiApiKey() {
+  const raw = requiredEnv("GEMINI_API_KEY");
+  const keys = raw
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+
+  if (keys.length === 0) {
+    throw new Error("缺少 Render 环境变量：GEMINI_API_KEY");
+  }
+
+  const key = keys[apiKeyRoundRobinIndex % keys.length];
+  apiKeyRoundRobinIndex = (apiKeyRoundRobinIndex + 1) % keys.length;
+  return key;
+}
+
+function getGeminiConfig(selectedVoice) {
+  const apiKey = pickGeminiApiKey();
+  const systemPrompt = requiredEnv("GEMINI_SYSTEM_PROMPT");
 
   const rawEndpoint = String(
-    env.GEMINI_WS_URL || DEFAULT_GEMINI_WS_URL,
+    process.env.GEMINI_WS_URL || DEFAULT_GEMINI_WS_URL,
   ).trim();
 
   const endpoint = new URL(rawEndpoint);
 
-  /*
-   * 环境变量允许填 https:// 或 wss:// 地址；
-   * Node.js WebSocket 客户端连接时统一转为 wss://。
-   */
   if (endpoint.protocol === "https:") {
     endpoint.protocol = "wss:";
   }
@@ -506,24 +603,28 @@ function getGeminiConfig(env, requestedVoice) {
 
   endpoint.searchParams.set("key", apiKey);
 
-  const model = getSafeModelName(env);
+  const model = getSafeModelName();
+  const defaultVoice = getDefaultVoice();
+  const voice = String(selectedVoice || defaultVoice).trim();
 
-  const voice = String(requestedVoice || env.GEMINI_VOICE || "Kore").trim();
+  if (!getAllowedVoiceNames().includes(voice)) {
+    throw new Error("当前选择的语音不在 GEMINI_ALLOWED_VOICES 允许列表中。");
+  }
 
-  if (voice && !/^[A-Za-z][A-Za-z0-9_-]*$/.test(voice)) {
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(voice)) {
     throw new Error("GEMINI_VOICE 格式不正确。");
   }
 
   return {
-    wsUrl: endpoint.toString(),
+    webSocketUrl: endpoint.toString(),
     model,
     voice,
     systemPrompt,
   };
 }
 
-function getSafeModelName(env) {
-  const model = String(env.GEMINI_MODEL || DEFAULT_MODEL)
+function getSafeModelName() {
+  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL)
     .trim()
     .replace(/^models\//, "");
 
@@ -532,6 +633,49 @@ function getSafeModelName(env) {
   }
 
   return model;
+}
+
+function getDefaultVoice() {
+  const voice = String(process.env.GEMINI_VOICE || "Kore").trim();
+
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(voice)) {
+    throw new Error("GEMINI_VOICE 格式不正确。");
+  }
+
+  return voice;
+}
+
+function getAllowedVoiceNames() {
+  const raw = String(process.env.GEMINI_ALLOWED_VOICES || "").trim();
+
+  const configuredVoices = raw
+    ? raw
+        .split(",")
+        .map((voice) => voice.trim())
+        .filter(Boolean)
+    : VOICE_CATALOG.map((voice) => voice.name);
+
+  const defaultVoice = getDefaultVoice();
+  const names = [...configuredVoices, defaultVoice];
+
+  const uniqueNames = [...new Set(names)];
+
+  for (const voice of uniqueNames) {
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(voice)) {
+      throw new Error(
+        "GEMINI_ALLOWED_VOICES 中存在格式不正确的语音名称。",
+      );
+    }
+  }
+
+  return uniqueNames;
+}
+
+function getVoiceOptions() {
+  return getAllowedVoiceNames().map((name) => ({
+    name,
+    label: voiceLabelMap.get(name) || name,
+  }));
 }
 
 function createSetupMessage(config) {
@@ -552,65 +696,213 @@ function createSetupMessage(config) {
   return {
     setup: {
       model: "models/" + config.model,
-
-      /*
-       * 注意：responseModalities 与 speechConfig 属于 generationConfig。
-       */
       generationConfig,
-
       systemInstruction: {
         parts: [
           {
-            text: config.systemPrompt,
+            // 在系统提示词末尾强化直接语音输出指令，防止扩展音色只生成内部文本而延迟发声
+            text:
+              config.systemPrompt +
+              "\n[System Note: Always respond immediately with spoken audio stream without silent text delay.]",
           },
         ],
       },
-
-      /*
-       * 电话界面中的实时字幕：
-       * - inputAudioTranscription：用户说话字幕
-       * - outputAudioTranscription：Gemini 回答字幕
-       */
       inputAudioTranscription: {},
       outputAudioTranscription: {},
     },
   };
 }
 
-function requiredEnv(env, name) {
-  const value = typeof env[name] === "string" ? env[name].trim() : "";
+function requiredEnv(name) {
+  const value =
+    typeof process.env[name] === "string"
+      ? process.env[name].trim()
+      : "";
 
   if (!value) {
-    throw new Error("缺少环境变量：" + name);
+    throw new Error("缺少 Render 环境变量：" + name);
   }
 
   return value;
 }
 
-function parseErrorText(rawText) {
-  try {
-    const text = String(rawText || "").replace(/\s+/g, " ").trim();
+function getAccessPassword() {
+  return typeof process.env.ACCESS_PASSWORD === "string"
+    ? process.env.ACCESS_PASSWORD.trim()
+    : "";
+}
 
-    if (!text) return "";
+function requireHttpAuth(req, res, next) {
+  if (isRequestAuthorized(req)) {
+    next();
+    return;
+  }
+
+  res.status(401).set({
+    "WWW-Authenticate": 'Basic realm="Gemini Live Voice"',
+    "content-type": "text/plain; charset=UTF-8",
+  });
+
+  res.send("Unauthorized");
+}
+
+function isRequestAuthorized(req) {
+  const expectedPassword = getAccessPassword();
+
+  if (!expectedPassword) {
+    return true;
+  }
+
+  const url = getRequestUrl(req);
+  const queryPassword = url.searchParams.get("pwd");
+
+  if (queryPassword && secretEquals(queryPassword, expectedPassword)) {
+    return true;
+  }
+
+  const cookiePassword = getCookie(req, "auth");
+
+  if (cookiePassword && secretEquals(cookiePassword, expectedPassword)) {
+    return true;
+  }
+
+  const basicPassword = getBasicPassword(req);
+
+  if (basicPassword && secretEquals(basicPassword, expectedPassword)) {
+    return true;
+  }
+
+  return false;
+}
+
+function queryPasswordMatches(req, expectedPassword) {
+  const value = getRequestUrl(req).searchParams.get("pwd");
+  return Boolean(value && secretEquals(value, expectedPassword));
+}
+
+function getCookie(req, name) {
+  const header = String(req.headers.cookie || "");
+
+  for (const item of header.split(";")) {
+    const index = item.indexOf("=");
+
+    if (index < 0) continue;
+
+    const key = item.slice(0, index).trim();
+    const value = item.slice(index + 1).trim();
+
+    if (key !== name) continue;
 
     try {
-      const json = JSON.parse(text);
-
-      if (json && json.error && json.error.message) {
-        return String(json.error.message).slice(0, 500);
-      }
+      return decodeURIComponent(value);
     } catch {
-      // 非 JSON 时回退为普通文本。
+      return "";
     }
+  }
 
-    return text.slice(0, 500);
+  return "";
+}
+
+function getBasicPassword(req) {
+  const authHeader = String(req.headers.authorization || "");
+
+  if (!authHeader.startsWith("Basic ")) {
+    return "";
+  }
+
+  try {
+    const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf8");
+    const separator = decoded.indexOf(":");
+
+    return separator >= 0 ? decoded.slice(separator + 1) : decoded;
   } catch {
     return "";
   }
 }
 
+function secretEquals(input, expected) {
+  const left = Buffer.from(String(input));
+  const right = Buffer.from(String(expected));
+
+  return (
+    left.length === right.length &&
+    timingSafeEqual(left, right)
+  );
+}
+
+function getRequestUrl(req) {
+  return new URL(req.url || "/", getRequestOrigin(req));
+}
+
+function getRequestOrigin(req) {
+  const forwardedProtocol = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim();
+
+  const protocol =
+    forwardedProtocol ||
+    (req.socket.encrypted ? "https" : "http");
+
+  const host = String(req.headers.host || "localhost");
+
+  return protocol + "://" + host;
+}
+
+function isHttpsRequest(req) {
+  return getRequestOrigin(req).startsWith("https://");
+}
+
+function isAllowedWebSocketOrigin(req) {
+  const requestOrigin = String(req.headers.origin || "").replace(/\/$/, "");
+
+  const allowedOrigin = String(
+    process.env.ALLOWED_ORIGIN || getRequestOrigin(req),
+  ).replace(/\/$/, "");
+
+  return Boolean(requestOrigin && requestOrigin === allowedOrigin);
+}
+
+function rejectUpgrade(socket, statusCode, message, extraHeaders = {}) {
+  const body = message + "\n";
+
+  const statusText =
+    statusCode === 401
+      ? "Unauthorized"
+      : statusCode === 403
+        ? "Forbidden"
+        : statusCode === 404
+          ? "Not Found"
+          : "Bad Request";
+
+  const headers = {
+    Connection: "close",
+    "Content-Type": "text/plain; charset=UTF-8",
+    "Content-Length": Buffer.byteLength(body),
+    ...extraHeaders,
+  };
+
+  const rawHeaders = Object.entries(headers)
+    .map(([name, value]) => name + ": " + value)
+    .join("\r\n");
+
+  socket.write(
+    "HTTP/1.1 " +
+      statusCode +
+      " " +
+      statusText +
+      "\r\n" +
+      rawHeaders +
+      "\r\n\r\n" +
+      body,
+  );
+
+  socket.destroy();
+}
+
 async function wsDataToText(data) {
-  if (typeof data === "string") return data;
+  if (typeof data === "string") {
+    return data;
+  }
 
   if (Buffer.isBuffer(data)) {
     return data.toString("utf8");
@@ -626,16 +918,51 @@ async function wsDataToText(data) {
     );
   }
 
-  if (typeof Blob !== "undefined" && data instanceof Blob) {
-    return await data.text();
-  }
-
   return String(data);
 }
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
+
+function gracefulShutdown(signal) {
+  console.log("[Render] 收到 " + signal + "，正在关闭 WebSocket 会话…");
+
+  clearInterval(heartbeatTimer);
+
+  for (const client of wss.clients) {
+    try {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: "closed",
+            code: 1012,
+            message: "服务正在重启，请重新拨号。",
+          }),
+        );
+
+        client.close(1012, "service restarting");
+      } else {
+        client.terminate();
+      }
+    } catch {
+      client.terminate();
+    }
+  }
+
+  server.close(() => {
+    console.log("[Render] HTTP 服务已关闭。");
+  });
+
+  const forceExitTimer = setTimeout(() => {
+    process.exit(0);
+  }, 27_000);
+
+  forceExitTimer.unref();
+}
+
+process.once("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.once("SIGINT", () => gracefulShutdown("SIGINT"));
 
 const HTML = String.raw`<!doctype html>
 <html lang="zh-CN">
@@ -701,7 +1028,7 @@ const HTML = String.raw`<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      min-height: 40px;
+      min-height: 42px;
       gap: 10px;
     }
 
@@ -725,10 +1052,10 @@ const HTML = String.raw`<!doctype html>
       display: flex;
       align-items: center;
       gap: 6px;
-      background: rgba(22, 30, 51, .75);
+      background: rgba(22, 30, 51, .78);
       border: 1px solid var(--panel-border);
       border-radius: 12px;
-      padding: 5px 10px;
+      padding: 6px 10px;
       font-size: 12px;
       color: var(--muted);
     }
@@ -741,7 +1068,8 @@ const HTML = String.raw`<!doctype html>
       font-weight: 600;
       outline: none;
       cursor: pointer;
-      padding-right: 2px;
+      max-width: 145px;
+      text-overflow: ellipsis;
     }
 
     .voice-picker select option {
@@ -755,11 +1083,13 @@ const HTML = String.raw`<!doctype html>
     }
 
     .stage {
-      flex: 0 0 auto;
-      padding-top: clamp(10px, 3.5vh, 45px);
-      display: grid;
-      justify-items: center;
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
       text-align: center;
+      min-height: 0;
     }
 
     .orb-wrap {
@@ -768,6 +1098,7 @@ const HTML = String.raw`<!doctype html>
       height: 174px;
       display: grid;
       place-items: center;
+      transition: transform .25s ease;
     }
 
     .ring,
@@ -835,7 +1166,7 @@ const HTML = String.raw`<!doctype html>
     }
 
     .status {
-      margin-top: clamp(12px, 2.8vh, 36px);
+      margin-top: clamp(14px, 3vh, 34px);
       min-height: 44px;
     }
 
@@ -861,32 +1192,61 @@ const HTML = String.raw`<!doctype html>
       letter-spacing: .08em;
     }
 
+    /* 折叠/展开字幕控制栏 */
+    .caption-drawer {
+      flex: 0 1 auto;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      margin-top: 8px;
+    }
+
+    .caption-toggle {
+      align-self: center;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(28, 39, 66, .72);
+      border: 1px solid var(--panel-border);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      transition: background .15s ease, color .15s ease;
+    }
+
+    .caption-toggle:hover {
+      background: rgba(42, 57, 94, .85);
+      color: var(--text);
+    }
+
     .captions {
-      flex: 1 1 0;
-      min-height: 75px;
-      margin-top: clamp(10px, 2.5vh, 28px);
-      padding: 14px;
+      height: 22svh;
+      min-height: 110px;
+      max-height: 220px;
+      margin-top: 10px;
+      padding: 13px 15px;
       overflow-y: auto;
       border: 1px solid var(--panel-border);
-      border-radius: 20px;
-      background: linear-gradient(145deg, rgba(20, 28, 49, .77), rgba(11, 16, 30, .5));
+      border-radius: 18px;
+      background: linear-gradient(145deg, rgba(20, 28, 49, .82), rgba(11, 16, 30, .58));
       scrollbar-width: thin;
     }
 
     .caption-empty {
       height: 100%;
-      min-height: 50px;
       display: grid;
       place-items: center;
       color: #8490b2;
       text-align: center;
       font-size: 13px;
-      line-height: 1.65;
+      line-height: 1.6;
     }
 
     .line {
-      margin: 0 0 13px;
-      line-height: 1.55;
+      margin: 0 0 11px;
+      line-height: 1.5;
       font-size: 14px;
       overflow-wrap: anywhere;
     }
@@ -927,7 +1287,7 @@ const HTML = String.raw`<!doctype html>
 
     .controls {
       flex: 0 0 auto;
-      margin-top: clamp(12px, 2.2vh, 22px);
+      margin-top: 12px;
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 12px;
@@ -984,7 +1344,7 @@ const HTML = String.raw`<!doctype html>
 
     .hint {
       flex: 0 0 auto;
-      margin: clamp(8px, 1.5vh, 14px) 5px 0;
+      margin: 10px 5px 0;
       color: #7f8aaa;
       text-align: center;
       font-size: 11px;
@@ -995,23 +1355,15 @@ const HTML = String.raw`<!doctype html>
       display: none !important;
     }
 
-    /* 针对手机及紧凑高度屏幕的自适应缩放 */
+    /* 当字幕展开且屏幕较矮时自动缩小光球，绝不挤压底部按钮 */
     @media (max-height: 760px) {
-      .stage {
-        padding-top: 8px;
+      body[data-captions="open"] .orb-wrap {
+        transform: scale(.74);
+        margin: -22px 0;
       }
 
-      .orb-wrap {
-        transform: scale(.78);
-        margin: -18px 0;
-      }
-
-      .status {
-        margin-top: 10px;
-      }
-
-      .status-main {
-        font-size: 19px;
+      body[data-captions="open"] .status {
+        margin-top: 8px;
       }
 
       .call-btn {
@@ -1023,19 +1375,15 @@ const HTML = String.raw`<!doctype html>
       }
     }
 
-    @media (max-height: 620px) {
+    @media (max-height: 640px) {
       .orb-wrap {
-        transform: scale(.64);
-        margin: -30px 0;
+        transform: scale(.72);
+        margin: -24px 0;
       }
 
-      .status {
-        margin-top: 6px;
-        min-height: 36px;
-      }
-
-      .timer {
-        margin-top: 2px;
+      .captions {
+        height: 18svh;
+        min-height: 90px;
       }
 
       .hint {
@@ -1043,35 +1391,31 @@ const HTML = String.raw`<!doctype html>
       }
     }
 
-    /* 针对 iPad 等平板设备的舒适布局适配 */
     @media (min-width: 768px) and (min-height: 820px) {
       .shell {
         width: min(100%, 600px);
         padding-top: 28px;
         padding-bottom: 28px;
       }
+
+      .captions {
+        max-height: 260px;
+      }
     }
   </style>
 </head>
-<body data-phase="idle" data-speaking="false" data-default-voice="__DEFAULT_VOICE__">
+<body data-phase="idle" data-speaking="false" data-captions="closed">
   <main class="shell">
     <header class="topbar">
       <div class="brand">
         <strong id="modelName">Gemini Live</strong>
-        <span>端到端加密连接由代理服务转发</span>
+        <span>端到端加密连接由代理转发</span>
       </div>
 
       <label class="voice-picker" for="voiceSelect">
         <span>音色</span>
         <select id="voiceSelect" aria-label="选择语音音色">
-          <option value="Puck">Puck (活泼男声)</option>
-          <option value="Charon">Charon (沉稳男声)</option>
-          <option value="Kore">Kore (自然女声)</option>
-          <option value="Fenrir">Fenrir (浑厚男声)</option>
-          <option value="Aoede">Aoede (温和女声)</option>
-          <option value="Leda">Leda (清亮女声)</option>
-          <option value="Orus">Orus (成熟男声)</option>
-          <option value="Zephyr">Zephyr (轻快女声)</option>
+          <option value="Kore">Kore · 坚定</option>
         </select>
       </label>
     </header>
@@ -1089,9 +1433,15 @@ const HTML = String.raw`<!doctype html>
       </div>
     </section>
 
-    <section id="captions" class="captions" aria-label="实时字幕">
-      <div id="captionEmpty" class="caption-empty">
-        通话接通后，这里会显示你和 Gemini 的实时字幕。
+    <section class="caption-drawer">
+      <button id="captionToggle" class="caption-toggle" type="button" aria-expanded="false">
+        💬 展开实时字幕
+      </button>
+
+      <div id="captions" class="captions" aria-label="实时字幕" hidden>
+        <div id="captionEmpty" class="caption-empty">
+          通话接通后，这里会显示你和 Gemini 的实时字幕。
+        </div>
       </div>
     </section>
 
@@ -1119,6 +1469,7 @@ const HTML = String.raw`<!doctype html>
     const muteButton = document.getElementById('muteButton');
     const endButton = document.getElementById('endButton');
     const voiceSelect = document.getElementById('voiceSelect');
+    const captionToggle = document.getElementById('captionToggle');
 
     const orb = document.getElementById('orb');
     const statusMain = document.getElementById('statusMain');
@@ -1129,31 +1480,50 @@ const HTML = String.raw`<!doctype html>
     const captions = document.getElementById('captions');
     const captionEmpty = document.getElementById('captionEmpty');
 
-    // 初始化默认音色与本地记忆
-    (function initVoiceSelect() {
-      const serverDefault = document.body.dataset.defaultVoice || 'Kore';
-      const savedVoice = localStorage.getItem('gemini_live_voice') || serverDefault;
+    // 字幕折叠与展开切换（默认收起）
+    let captionsExpanded = false;
+    captionToggle.addEventListener('click', function () {
+      captionsExpanded = !captionsExpanded;
+      captions.hidden = !captionsExpanded;
+      document.body.dataset.captions = captionsExpanded ? 'open' : 'closed';
+      captionToggle.setAttribute('aria-expanded', String(captionsExpanded));
+      captionToggle.textContent = captionsExpanded ? '🔽 收起实时字幕' : '💬 展开实时字幕';
+      if (captionsExpanded) {
+        scrollCaptionsToBottom();
+      }
+    });
 
-      let exists = false;
-      for (let i = 0; i < voiceSelect.options.length; i++) {
-        if (voiceSelect.options[i].value === savedVoice) {
-          exists = true;
-          break;
+    // 从后端 /config 加载完整音色列表
+    async function loadVoiceConfig() {
+      try {
+        const res = await fetch('/config');
+        if (!res.ok) return;
+        const data = await res.json();
+        const voices = Array.isArray(data.voices) ? data.voices : [];
+        const savedVoice = localStorage.getItem('gemini_live_voice') || data.defaultVoice || 'Kore';
+
+        if (voices.length > 0) {
+          voiceSelect.replaceChildren();
+          for (const item of voices) {
+            const opt = document.createElement('option');
+            opt.value = item.name;
+            opt.textContent = item.label || item.name;
+            voiceSelect.appendChild(opt);
+          }
         }
-      }
 
-      if (!exists && savedVoice) {
-        const customOpt = document.createElement('option');
-        customOpt.value = savedVoice;
-        customOpt.textContent = savedVoice;
-        voiceSelect.appendChild(customOpt);
-      }
+        voiceSelect.value = savedVoice;
+        if (!voiceSelect.value && voiceSelect.options.length > 0) {
+          voiceSelect.selectedIndex = 0;
+        }
+      } catch {}
+    }
 
-      voiceSelect.value = savedVoice;
-      voiceSelect.addEventListener('change', function () {
-        localStorage.setItem('gemini_live_voice', voiceSelect.value);
-      });
-    })();
+    voiceSelect.addEventListener('change', function () {
+      localStorage.setItem('gemini_live_voice', voiceSelect.value);
+    });
+
+    void loadVoiceConfig();
 
     let socket = null;
     let sessionReady = false;
@@ -1252,7 +1622,9 @@ const HTML = String.raw`<!doctype html>
     }
 
     function scrollCaptionsToBottom() {
-      captions.scrollTop = captions.scrollHeight;
+      if (!captions.hidden) {
+        captions.scrollTop = captions.scrollHeight;
+      }
     }
 
     function addNote(text) {
@@ -1325,7 +1697,9 @@ const HTML = String.raw`<!doctype html>
           throw new Error('当前浏览器不支持 Web Audio API。');
         }
 
-        audioContext = new AudioContextClass();
+        audioContext = new AudioContextClass({
+          latencyHint: 'interactive',
+        });
       }
 
       if (audioContext.state === 'suspended') {
@@ -1374,9 +1748,9 @@ const HTML = String.raw`<!doctype html>
       micSource = ctx.createMediaStreamSource(mediaStream);
 
       /*
-       * 缓冲区从 4096 减小为 2048，直接降低近一半的声音采集延迟（约 40ms）。
+       * 采集缓冲区进一步从 2048 降为 1024（约 21ms 一帧），大幅提升实时响应速度。
        */
-      micProcessor = ctx.createScriptProcessor(2048, 1, 1);
+      micProcessor = ctx.createScriptProcessor(1024, 1, 1);
       silentMicSink = ctx.createGain();
       silentMicSink.gain.value = 0;
 
@@ -1397,10 +1771,7 @@ const HTML = String.raw`<!doctype html>
           return;
         }
 
-        /*
-         * 防止网络暂时堵塞时积压大量实时音频。
-         */
-        if (socket.bufferedAmount > 512 * 1024) {
+        if (socket.bufferedAmount > 256 * 1024) {
           return;
         }
 
@@ -1500,10 +1871,6 @@ const HTML = String.raw`<!doctype html>
       refreshButtons();
 
       try {
-        /*
-         * 麦克风权限必须尽可能在用户点击事件中请求，
-         * 否则部分浏览器会拒绝权限请求。
-         */
         await startMicrophoneCapture();
       } catch (error) {
         setPhase('idle');
@@ -1525,7 +1892,7 @@ const HTML = String.raw`<!doctype html>
       connectTimer = setTimeout(function () {
         if (socket === ws && !sessionReady) {
           lastFailure =
-            '连接等待超过 20 秒。请检查环境变量配置或查看服务器日志。';
+            '连接等待超过 20 秒。请检查 Render 环境变量或服务日志。';
           ws.close(1011, 'connection timeout');
         }
       }, 20_000);
@@ -1806,12 +2173,16 @@ const HTML = String.raw`<!doctype html>
         source.buffer = buffer;
         source.connect(ctx.destination);
 
-        // 优化播放排队调度：消除多余的 25ms 缓冲延迟，避免时间戳落后导致累积延迟
+        /*
+         * 35ms 首包抗抖动微缓冲：
+         * 当队列为空（首包到达）时预留 35ms 缓冲窗口，防止非热音色第 1 帧与第 2 帧之间断流；
+         * 后续连续帧紧密无缝拼接。
+         */
         const now = ctx.currentTime;
-        if (nextPlayTime < now) {
-          nextPlayTime = now;
+        if (nextPlayTime <= now) {
+          nextPlayTime = now + 0.035;
         }
-        const startAt = Math.max(now + 0.008, nextPlayTime);
+        const startAt = nextPlayTime;
 
         source.start(startAt);
         nextPlayTime = startAt + buffer.duration;
@@ -1950,6 +2321,8 @@ const HTML = String.raw`<!doctype html>
 </body>
 </html>`;
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Gemini Live Server] Listening on port ${PORT}`);
+const port = Number(process.env.PORT || 10000);
+
+server.listen(port, "0.0.0.0", () => {
+  console.log("[Render] Gemini Live 服务正在监听 0.0.0.0:" + port);
 });
