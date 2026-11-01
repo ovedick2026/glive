@@ -695,11 +695,17 @@ function createSetupMessage(config, clientMemory = "") {
     };
   }
 
-  let finalPrompt = config.systemPrompt;
+  let finalPrompt =
+    config.systemPrompt +
+    "\n\n[CRITICAL AUDIO & SHORT-WORD RULES:\n" +
+    "1. Short utterances like 'Pardon?', 'What?', 'Huh?', 'Sorry?', 'Yeah', 'No', 'Wait' are ALWAYS English. NEVER interpret 'Pardon' as French or any other language.\n" +
+    "2. Ignore all background room noise, TV sounds, coughing, or distant voices. Only respond to clear English or Mandarin Chinese speech.\n" +
+    "3. You are Physically Unable to speak any language other than English (and brief Mandarin Chinese when helping).]";
+
   const cleanMemory = String(clientMemory || "").trim().slice(0, 1500);
   if (cleanMemory) {
     finalPrompt +=
-      "\n\n[PAST MEMORY LOG (Recent conversation history with this child from previous calls — use this to remember their level, interests, and progress, and pick a fresh topic today)]:\n" +
+      "\n\n[PAST MEMORY LOG (Recent conversation history with this child from previous calls)]:\n" +
       cleanMemory;
   }
 
@@ -713,6 +719,25 @@ function createSetupMessage(config, clientMemory = "") {
             text: finalPrompt,
           },
         ],
+      },
+      /*
+       * 1. 核心修复：开启滑动窗口上下文压缩！
+       * 突破 Gemini Live 默认 15 分钟音频会话上限，支持无限时长对话。
+       */
+      contextWindowCompression: {
+        slidingWindow: {},
+      },
+      /*
+       * 2. 抗环境噪音配置：
+       * TURN_INCLUDES_ONLY_ACTIVITY 让 Gemini 只截取人声说话片段，丢弃房间背景杂音。
+       */
+      realtimeInputConfig: {
+        turnCoverage: "TURN_INCLUDES_ONLY_ACTIVITY",
+        automaticActivityDetection: {
+          startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+          endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+          silenceDurationMs: 600,
+        },
       },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
@@ -1787,6 +1812,10 @@ const HTML = String.raw`<!doctype html>
       silentMicSink = ctx.createGain();
       silentMicSink.gain.value = 0;
 
+      // 智能噪音门限状态：说话结束后保留约 500ms 尾音窗口，其余时间屏蔽环境杂音
+      let speechHoldFrames = 0;
+      const NOISE_GATE_THRESHOLD = 0.012; // 环境底噪阈值（普通环境杂音通常在 0.002~0.009 之间）
+
       micProcessor.onaudioprocess = function (event) {
         const input = event.inputBuffer.getChannelData(0);
         const level = rms(input);
@@ -1808,8 +1837,23 @@ const HTML = String.raw`<!doctype html>
           return;
         }
 
+        /*
+         * 智能噪音门（Noise Gate）：
+         * 当音量大于阈值时判定为人声，开启 24 帧（约 0.5 秒）的尾音保持；
+         * 当房间只有背景杂音时，将音频清零为纯静音帧发送，彻底杜绝环境杂音导致识别成外语！
+         */
+        let audioFrame = input;
+        if (level >= NOISE_GATE_THRESHOLD) {
+          speechHoldFrames = 24;
+        } else if (speechHoldFrames > 0) {
+          speechHoldFrames--;
+        } else {
+          // 处于环境噪音期：发送纯净静音，既保持 Gemini VAD 计时不断流，又完全隔绝外界杂音
+          audioFrame = new Float32Array(input.length);
+        }
+
         const pcm16 = downsampleFloat32ToPcm16(
-          input,
+          audioFrame,
           ctx.sampleRate,
           16000,
         );
