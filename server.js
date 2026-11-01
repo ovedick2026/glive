@@ -685,6 +685,8 @@ function createSetupMessage(config) {
 
   if (config.voice) {
     generationConfig.speechConfig = {
+      // 1. 在 API 层面锁定语音合成与识别的主语言为英语 (en-US)
+      languageCode: "en-US",
       voiceConfig: {
         prebuiltVoiceConfig: {
           voiceName: config.voice,
@@ -700,10 +702,13 @@ function createSetupMessage(config) {
       systemInstruction: {
         parts: [
           {
-            // 在系统提示词末尾强化直接语音输出指令，防止扩展音色只生成内部文本而延迟发声
+            // 2. 在系统提示词末尾强制锁定：只把用户语音当英语或中文听，且永远只用英语回复
             text:
               config.systemPrompt +
-              "\n[System Note: Always respond immediately with spoken audio stream without silent text delay.]",
+              "\n\n[Strict Language Rules:\n" +
+              "1. MUST RESPOND IN ENGLISH ONLY. Never speak or output any other language under any circumstances.\n" +
+              "2. The user is only speaking English (or occasionally Chinese). Never transcribe or interpret the user's audio as Spanish, Russian, Arabic, Hindi, Korean, Japanese, or any other third language.\n" +
+              "3. If the audio is noisy or unclear, politely ask the user to repeat in English.]",
           },
         ],
       },
