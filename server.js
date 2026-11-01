@@ -154,8 +154,9 @@ wss.on("connection", (browser, request) => {
 
   const url = getRequestUrl(request);
   const selectedVoice = url.searchParams.get("voice") || "";
+  const clientMemory = url.searchParams.get("memory") || ""; // <-- 新增这一行
 
-  const bridge = createGeminiBridge(browser, selectedVoice);
+  const bridge = createGeminiBridge(browser, selectedVoice, clientMemory); // <-- 传入 clientMemory
   bridge.install();
   void bridge.connect();
 });
@@ -217,7 +218,7 @@ wss.on("close", () => {
   clearInterval(heartbeatTimer);
 });
 
-function createGeminiBridge(browser, selectedVoice) {
+function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
   let upstream = null;
   let phase = "connecting"; // connecting | setting-up | ready | closed
   let closed = false;
@@ -323,7 +324,7 @@ function createGeminiBridge(browser, selectedVoice) {
       });
 
       try {
-        upstream.send(JSON.stringify(createSetupMessage(config)));
+        upstream.send(JSON.stringify(createSetupMessage(config, clientMemory)));
       } catch (error) {
         fail("无法发送 Gemini setup 消息：" + errorMessage(error));
         return;
@@ -678,14 +679,13 @@ function getVoiceOptions() {
   }));
 }
 
-function createSetupMessage(config) {
+function createSetupMessage(config, clientMemory = "") {
   const generationConfig = {
     responseModalities: ["AUDIO"],
   };
 
   if (config.voice) {
     generationConfig.speechConfig = {
-      // 1. 在 API 层面锁定语音合成与识别的主语言为英语 (en-US)
       languageCode: "en-US",
       voiceConfig: {
         prebuiltVoiceConfig: {
@@ -695,6 +695,14 @@ function createSetupMessage(config) {
     };
   }
 
+  let finalPrompt = config.systemPrompt;
+  const cleanMemory = String(clientMemory || "").trim().slice(0, 1500);
+  if (cleanMemory) {
+    finalPrompt +=
+      "\n\n[PAST MEMORY LOG (Recent conversation history with this child from previous calls — use this to remember their level, interests, and progress, and pick a fresh topic today)]:\n" +
+      cleanMemory;
+  }
+
   return {
     setup: {
       model: "models/" + config.model,
@@ -702,13 +710,7 @@ function createSetupMessage(config) {
       systemInstruction: {
         parts: [
           {
-            // 2. 在系统提示词末尾强制锁定：只把用户语音当英语或中文听，且永远只用英语回复
-            text:
-              config.systemPrompt +
-              "\n\n[Strict Language Rules:\n" +
-              "1. MUST RESPOND IN ENGLISH ONLY. Never speak or output any other language under any circumstances.\n" +
-              "2. The user is only speaking English (or occasionally Chinese). Never transcribe or interpret the user's audio as Spanish, Russian, Arabic, Hindi, Korean, Japanese, or any other third language.\n" +
-              "3. If the audio is noisy or unclear, politely ask the user to repeat in English.]",
+            text: finalPrompt,
           },
         ],
       },
@@ -1552,10 +1554,36 @@ const HTML = String.raw`<!doctype html>
     let activeInputLine = null;
     let activeOutputLine = null;
 
+    // 提取最近 16 条对话存入浏览器本地作为跨天记忆
+    function saveConversationMemory() {
+      try {
+        const lines = captions.querySelectorAll('.line.me, .line.assistant');
+        if (lines.length < 2) return;
+
+        const recent = [];
+        const startIdx = Math.max(0, lines.length - 12);
+        for (let i = startIdx; i < lines.length; i++) {
+          const role = lines[i].classList.contains('me') ? 'Child' : 'Tutor';
+          const text = lines[i].querySelector('.text')?.textContent?.trim() || '';
+          if (text) {
+            recent.push(role + ': ' + text);
+          }
+        }
+
+        if (recent.length > 0) {
+          const prev = localStorage.getItem('gemini_child_memory') || '';
+          const combined = (prev ? prev + '\n---\n' : '') + recent.join('\n');
+          // 只保留最近 1200 个字符，防止 URL 过长，永远滚动更新最新记忆
+          localStorage.setItem('gemini_child_memory', combined.slice(-1200));
+        }
+      } catch {}
+    }
+
     function workerWebSocketUrl() {
       const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
       const voice = encodeURIComponent(voiceSelect.value || 'Kore');
-      return scheme + location.host + '/ws?voice=' + voice;
+      const memory = encodeURIComponent(localStorage.getItem('gemini_child_memory') || '');
+      return scheme + location.host + '/ws?voice=' + voice + '&memory=' + memory;
     }
 
     function setPhase(phase) {
@@ -1934,6 +1962,7 @@ const HTML = String.raw`<!doctype html>
       });
 
       ws.addEventListener('close', function (event) {
+        saveConversationMemory();
         if (socket !== ws) return;
 
         clearConnectTimer();
@@ -1965,6 +1994,7 @@ const HTML = String.raw`<!doctype html>
     }
 
     function endCall() {
+      saveConversationMemory();
       manuallyEnded = true;
       clearConnectTimer();
 
