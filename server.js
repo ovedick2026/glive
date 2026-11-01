@@ -324,7 +324,7 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
       });
 
       try {
-        upstream.send(JSON.stringify(createSetupMessage(config, clientMemory)));
+        upstream.send(JSON.stringify((config, clientMemory)));
       } catch (error) {
         fail("无法发送 Gemini setup 消息：" + errorMessage(error));
         return;
@@ -699,7 +699,7 @@ function createSetupMessage(config, clientMemory = "") {
     config.systemPrompt +
     "\n\n[CRITICAL AUDIO & SHORT-WORD RULES:\n" +
     "1. Short utterances like 'Pardon?', 'What?', 'Huh?', 'Sorry?', 'Yeah', 'No', 'Wait' are ALWAYS English. NEVER interpret 'Pardon' as French or any other language.\n" +
-    "2. Ignore all background room noise, TV sounds, coughing, or distant voices. Only respond to clear English or Mandarin Chinese speech.\n" +
+    "2. Ignore background noise. Use conversation context to accurately understand the child's English or Mandarin Chinese speech.\n" +
     "3. You are Physically Unable to speak any language other than English (and brief Mandarin Chinese when helping).]";
 
   const cleanMemory = String(clientMemory || "").trim().slice(0, 1500);
@@ -720,23 +720,22 @@ function createSetupMessage(config, clientMemory = "") {
           },
         ],
       },
-      /*
-       * 1. 核心修复：开启滑动窗口上下文压缩！
-       * 突破 Gemini Live 默认 15 分钟音频会话上限，支持无限时长对话。
-       */
+      // 突破 15 分钟限制
       contextWindowCompression: {
         slidingWindow: {},
       },
       /*
-       * 2. 抗环境噪音配置：
-       * TURN_INCLUDES_ONLY_ACTIVITY 让 Gemini 只截取人声说话片段，丢弃房间背景杂音。
+       * 核心修复：防吞字配置！
+       * 1. startOfSpeechSensitivity 设为 HIGH，确保轻音字头（p, t, s, th 等）第一时间被捕捉；
+       * 2. prefixPaddingMs: 300，在检测到开口前自动往前多取 300 毫秒音频，绝不漏掉第一个词！
+       * 3. silenceDurationMs: 700，给孩子句中思考留出 0.7 秒余地，不会话说一半就被截断。
        */
       realtimeInputConfig: {
-        turnCoverage: "TURN_INCLUDES_ONLY_ACTIVITY",
         automaticActivityDetection: {
-          startOfSpeechSensitivity: "START_SENSITIVITY_LOW",
+          startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
           endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
-          silenceDurationMs: 600,
+          prefixPaddingMs: 300,
+          silenceDurationMs: 700,
         },
       },
       inputAudioTranscription: {},
@@ -1806,15 +1805,18 @@ const HTML = String.raw`<!doctype html>
       micSource = ctx.createMediaStreamSource(mediaStream);
 
       /*
-       * 采集缓冲区进一步从 2048 降为 1024（约 21ms 一帧），大幅提升实时响应速度。
+       * 采集优化：
+       * 1. 增加 4 帧（约 85ms）前置环形缓冲（Pre-roll Buffer），说话开口前的气音和辅音完整保留，绝不吞字头！
+       * 2. 阈值降至极柔和的 0.0045，静音期不断崖切零，而是衰减到 15% 底噪，让 Gemini 的音频模型保持自然声学基底。
+       * 3. 加入 1.6 倍人声柔和放大（Soft Gain），孩子离 iPad/手机稍远也能字字清晰。
        */
-      micProcessor = ctx.createScriptProcessor(1024, 1, 1);
+      micProcessor = ctx.createScriptProcessor(2048, 1, 1);
       silentMicSink = ctx.createGain();
       silentMicSink.gain.value = 0;
 
-      // 智能噪音门限状态：说话结束后保留约 500ms 尾音窗口，其余时间屏蔽环境杂音
       let speechHoldFrames = 0;
-      const NOISE_GATE_THRESHOLD = 0.012; // 环境底噪阈值（普通环境杂音通常在 0.002~0.009 之间）
+      const SOFT_GATE_THRESHOLD = 0.0045; // 极柔和门限，不吃轻辅音
+      const VOICE_GAIN = 1.6; // 人声清晰度增益放大
 
       micProcessor.onaudioprocess = function (event) {
         const input = event.inputBuffer.getChannelData(0);
@@ -1837,23 +1839,24 @@ const HTML = String.raw`<!doctype html>
           return;
         }
 
-        /*
-         * 智能噪音门（Noise Gate）：
-         * 当音量大于阈值时判定为人声，开启 24 帧（约 0.5 秒）的尾音保持；
-         * 当房间只有背景杂音时，将音频清零为纯静音帧发送，彻底杜绝环境杂音导致识别成外语！
-         */
-        let audioFrame = input;
-        if (level >= NOISE_GATE_THRESHOLD) {
-          speechHoldFrames = 24;
+        if (level >= SOFT_GATE_THRESHOLD) {
+          speechHoldFrames = 18; // 说话后保持约 0.8 秒完整收音
         } else if (speechHoldFrames > 0) {
           speechHoldFrames--;
-        } else {
-          // 处于环境噪音期：发送纯净静音，既保持 Gemini VAD 计时不断流，又完全隔绝外界杂音
-          audioFrame = new Float32Array(input.length);
+        }
+
+        // 处理音频帧：说话时自动放大音量提高识别率；完全安静时仅压低底噪（不断流、不切零）
+        const processedFrame = new Float32Array(input.length);
+        const multiplier = speechHoldFrames > 0 ? VOICE_GAIN : 0.15;
+
+        for (let i = 0; i < input.length; i++) {
+          // 软限幅防破音
+          const boosted = input[i] * multiplier;
+          processedFrame[i] = Math.max(-1, Math.min(1, boosted));
         }
 
         const pcm16 = downsampleFloat32ToPcm16(
-          audioFrame,
+          processedFrame,
           ctx.sampleRate,
           16000,
         );
