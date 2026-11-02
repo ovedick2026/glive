@@ -198,9 +198,14 @@ wss.on("close", () => {
 
 function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
   let upstream = null;
-  let phase = "connecting"; // connecting | setting-up | ready | closed
+  let phase = "connecting";
   let closed = false;
   let setupTimer = null;
+  let upstreamFlushTimer = null;
+
+  const UPSTREAM_HIGH_WATER_BYTES = 128 * 1024;
+  const MAX_UPSTREAM_QUEUE_MESSAGES = 96;
+  const upstreamQueue = [];
 
   function sendToBrowser(payload) {
     if (!closed && browser.readyState === WebSocket.OPEN) {
@@ -213,6 +218,74 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
       clearTimeout(setupTimer);
       setupTimer = null;
     }
+  }
+
+  function clearUpstreamQueue() {
+    upstreamQueue.length = 0;
+
+    if (upstreamFlushTimer) {
+      clearTimeout(upstreamFlushTimer);
+      upstreamFlushTimer = null;
+    }
+  }
+
+  function scheduleUpstreamFlush() {
+    if (upstreamFlushTimer || upstreamQueue.length === 0) {
+      return;
+    }
+
+    upstreamFlushTimer = setTimeout(() => {
+      upstreamFlushTimer = null;
+      flushUpstreamQueue();
+    }, 10);
+  }
+
+  function flushUpstreamQueue() {
+    if (
+      closed ||
+      !upstream ||
+      upstream.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    try {
+      while (
+        upstreamQueue.length > 0 &&
+        upstream.bufferedAmount < UPSTREAM_HIGH_WATER_BYTES
+      ) {
+        upstream.send(upstreamQueue.shift());
+      }
+    } catch (error) {
+      fail("无法转发麦克风音频：" + errorMessage(error));
+      return;
+    }
+
+    if (upstreamQueue.length > 0) {
+      scheduleUpstreamFlush();
+    }
+  }
+
+  function queueUpstreamMessage(payload) {
+    if (
+      closed ||
+      !upstream ||
+      upstream.readyState !== WebSocket.OPEN
+    ) {
+      return false;
+    }
+
+    if (upstreamQueue.length >= MAX_UPSTREAM_QUEUE_MESSAGES) {
+      fail(
+        "网络上传拥塞。为了避免悄悄漏字，本次通话已停止；请检查网络后重新连接。",
+      );
+      return false;
+    }
+
+    upstreamQueue.push(JSON.stringify(payload));
+    flushUpstreamQueue();
+
+    return true;
   }
 
   function closeSocket(socket, code = 1000, reason = "") {
@@ -235,6 +308,7 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
     closed = true;
     phase = "closed";
     clearSetupTimer();
+    clearUpstreamQueue();
 
     closeSocket(upstream, code, reason);
     closeSocket(browser, code, reason);
@@ -435,40 +509,24 @@ function createGeminiBridge(browser, selectedVoice, clientMemory = "") {
         return;
       }
 
-      if (upstream.bufferedAmount > 256 * 1024) {
-        return;
-      }
-
-      try {
-        upstream.send(
-          JSON.stringify({
-            realtimeInput: {
-              audio: {
-                data: audioData,
-                mimeType: "audio/pcm;rate=16000",
-              },
-            },
-          }),
-        );
-      } catch (error) {
-        fail("无法转发麦克风音频：" + errorMessage(error));
-      }
+      queueUpstreamMessage({
+        realtimeInput: {
+          audio: {
+            data: audioData,
+            mimeType: "audio/pcm;rate=16000",
+          },
+        },
+      });
 
       return;
     }
 
     if (message.type === "audioEnd") {
-      try {
-        upstream.send(
-          JSON.stringify({
-            realtimeInput: {
-              audioStreamEnd: true,
-            },
-          }),
-        );
-      } catch (error) {
-        fail("无法发送音频结束信号：" + errorMessage(error));
-      }
+      queueUpstreamMessage({
+        realtimeInput: {
+          audioStreamEnd: true,
+        },
+      });
 
       return;
     }
@@ -648,29 +706,58 @@ function getVoiceOptions() {
   }));
 }
 
+function getInputLanguageCodes() {
+  const raw = String(
+    process.env.GEMINI_INPUT_LANGUAGE_CODES || "cmn-Hans-CN,en-US",
+  ).trim();
+
+  const codes = [
+    ...new Set(
+      raw
+        .split(",")
+        .map((code) => code.trim())
+        .filter(Boolean),
+    ),
+  ];
+
+  if (codes.length === 0) {
+    throw new Error("GEMINI_INPUT_LANGUAGE_CODES 不能为空。");
+  }
+
+  for (const code of codes) {
+    if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(code)) {
+      throw new Error(
+        "GEMINI_INPUT_LANGUAGE_CODES 中存在无效的 BCP-47 语言代码：" +
+          code,
+      );
+    }
+  }
+
+  return codes;
+}
+
 function createSetupMessage(config, clientMemory = "") {
   const generationConfig = {
     responseModalities: ["AUDIO"],
-  };
-
-  if (config.voice) {
-    generationConfig.speechConfig = {
+    speechConfig: {
       voiceConfig: {
         prebuiltVoiceConfig: {
           voiceName: config.voice,
         },
       },
-    };
-  }
+    },
+  };
 
   let finalPrompt =
     config.systemPrompt +
-    "\n\n[STRICT AUDIO & LANGUAGE RULES:\n" +
-    "1. Always respond immediately with spoken English audio stream.\n" +
-    "2. The user is ONLY speaking English or Mandarin Chinese. NEVER interpret any audio (such as 'Pardon?', 'What?', 'Huh?', or background noise) as French, Spanish, Russian, Arabic, or any other third language.\n" +
-    "3. If audio is unclear, politely ask in English: 'Could you say that again?']";
+    "\n\n[LANGUAGE RULES]\n" +
+    "1. The child may speak Mandarin Chinese and US English, including switching languages within one sentence.\n" +
+    "2. Understand the child's words in the language actually spoken. Do not assume French, Spanish, Russian, Arabic, or another language when the speech is Mandarin Chinese or English.\n" +
+    "3. If the audio is genuinely unclear, ask in English: 'Could you say that again?'\n" +
+    "4. Respond in natural spoken English only.";
 
   const cleanMemory = String(clientMemory || "").trim().slice(0, 1200);
+
   if (cleanMemory) {
     finalPrompt +=
       "\n\n[PAST MEMORY LOG (Recent conversation history with this child from previous calls)]:\n" +
@@ -688,12 +775,21 @@ function createSetupMessage(config, clientMemory = "") {
           },
         ],
       },
-      // 官方标准滑动窗口压缩：突破 15 分钟音频会话时长限制
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false,
+          prefixPaddingMs: 300,
+          silenceDurationMs: 700,
+          endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+        },
+      },
+      inputAudioTranscription: {
+        languageCodes: getInputLanguageCodes(),
+      },
+      outputAudioTranscription: {},
       contextWindowCompression: {
         slidingWindow: {},
       },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
     },
   };
 }
@@ -1525,6 +1621,11 @@ const HTML = String.raw`<!doctype html>
     let nextPlayTime = 0;
     const playingSources = new Set();
 
+    const BROWSER_WS_HIGH_WATER_BYTES = 128 * 1024;
+    const MAX_BROWSER_AUDIO_QUEUE_MESSAGES = 96;
+    const workerSendQueue = [];
+    let workerFlushTimer = null;
+
     let activeInputLine = null;
     let activeOutputLine = null;
 
@@ -1595,6 +1696,84 @@ const HTML = String.raw`<!doctype html>
         clearTimeout(connectTimer);
         connectTimer = null;
       }
+    }
+
+    function clearWorkerSendQueue() {
+      workerSendQueue.length = 0;
+
+      if (workerFlushTimer) {
+        clearTimeout(workerFlushTimer);
+        workerFlushTimer = null;
+      }
+    }
+
+    function scheduleWorkerQueueFlush() {
+      if (workerFlushTimer || workerSendQueue.length === 0) {
+        return;
+      }
+
+      workerFlushTimer = setTimeout(function () {
+        workerFlushTimer = null;
+        flushWorkerQueue();
+      }, 10);
+    }
+
+    function flushWorkerQueue() {
+      if (
+        !socket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        clearWorkerSendQueue();
+        return;
+      }
+
+      try {
+        while (
+          workerSendQueue.length > 0 &&
+          socket.bufferedAmount < BROWSER_WS_HIGH_WATER_BYTES
+        ) {
+          socket.send(workerSendQueue.shift());
+        }
+      } catch {
+        lastFailure = '浏览器发送麦克风音频失败。';
+        return;
+      }
+
+      if (workerSendQueue.length > 0) {
+        scheduleWorkerQueueFlush();
+      }
+    }
+
+    function queueWorkerMessage(payload) {
+      if (
+        !socket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        return false;
+      }
+
+      if (
+        workerSendQueue.length >=
+        MAX_BROWSER_AUDIO_QUEUE_MESSAGES
+      ) {
+        lastFailure =
+          '网络上传拥塞。为了避免悄悄漏字，通话已停止；请检查网络后重新连接。';
+
+        const ws = socket;
+
+        clearWorkerSendQueue();
+
+        try {
+          ws.close(1011, 'audio upload congested');
+        } catch {}
+
+        return false;
+      }
+
+      workerSendQueue.push(JSON.stringify(payload));
+      flushWorkerQueue();
+
+      return true;
     }
 
     function startDurationTimer() {
@@ -1751,11 +1930,7 @@ const HTML = String.raw`<!doctype html>
 
       micSource = ctx.createMediaStreamSource(mediaStream);
 
-      /*
-       * 恢复 100% 原始无损麦克风采集（不做任何人为切零或噪音门限截断），
-       * 确保每一个单词的轻音字头和尾音都完整传给 Gemini，解决录入错误问题。
-       */
-      micProcessor = ctx.createScriptProcessor(2048, 1, 1);
+      micProcessor = ctx.createScriptProcessor(1024, 1, 1);
       silentMicSink = ctx.createGain();
       silentMicSink.gain.value = 0;
 
@@ -1773,10 +1948,6 @@ const HTML = String.raw`<!doctype html>
           !socket ||
           socket.readyState !== WebSocket.OPEN
         ) {
-          return;
-        }
-
-        if (socket.bufferedAmount > 256 * 1024) {
           return;
         }
 
@@ -1863,6 +2034,8 @@ const HTML = String.raw`<!doctype html>
     async function startCall() {
       if (socket) return;
 
+      clearWorkerSendQueue();
+
       manuallyEnded = false;
       lastFailure = '';
       muted = false;
@@ -1938,6 +2111,7 @@ const HTML = String.raw`<!doctype html>
 
         saveConversationMemory();
         clearConnectTimer();
+        clearWorkerSendQueue();
 
         const endedByUser = manuallyEnded;
         socket = null;
@@ -1967,6 +2141,8 @@ const HTML = String.raw`<!doctype html>
 
     function endCall() {
       saveConversationMemory();
+      clearWorkerSendQueue();
+
       manuallyEnded = true;
       clearConnectTimer();
 
@@ -2005,12 +2181,7 @@ const HTML = String.raw`<!doctype html>
     }
 
     function sendToWorker(payload) {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        return false;
-      }
-
-      socket.send(JSON.stringify(payload));
-      return true;
+      return queueWorkerMessage(payload);
     }
 
     function handleWorkerMessage(message) {
